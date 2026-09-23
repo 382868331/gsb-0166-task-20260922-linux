@@ -31,6 +31,16 @@ from .pipeline import (
     Slot,
     run,
 )
+from .ooo import (
+    LOAD_LATENCY,
+    ROB_SIZE,
+    DispatchEvent,
+    OOOCycle,
+    OOORetireRecord,
+    OOORunResult,
+    SquashEvent,
+    run_ooo,
+)
 from .sequential import SeqTraceEntry, run_sequential
 
 __all__ = [
@@ -58,6 +68,14 @@ __all__ = [
     "RunResult",
     "Slot",
     "run",
+    "DispatchEvent",
+    "OOOCycle",
+    "OOORetireRecord",
+    "OOORunResult",
+    "SquashEvent",
+    "LOAD_LATENCY",
+    "ROB_SIZE",
+    "run_ooo",
     "SeqTraceEntry",
     "run_sequential",
 ]
