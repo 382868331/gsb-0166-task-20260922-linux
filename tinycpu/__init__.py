@@ -31,6 +31,16 @@ from .pipeline import (
     Slot,
     run,
 )
+from .ooo import (
+    MAX_WINDOW,
+    MIN_WINDOW,
+    REORDER_WINDOW,
+    CompletionRecord,
+    OoORunResult,
+    WindowCycle,
+    WindowSlot,
+    run_out_of_order,
+)
 from .sequential import SeqTraceEntry, run_sequential
 
 __all__ = [
@@ -58,6 +68,14 @@ __all__ = [
     "RunResult",
     "Slot",
     "run",
+    "REORDER_WINDOW",
+    "MIN_WINDOW",
+    "MAX_WINDOW",
+    "CompletionRecord",
+    "OoORunResult",
+    "WindowCycle",
+    "WindowSlot",
+    "run_out_of_order",
     "SeqTraceEntry",
     "run_sequential",
 ]

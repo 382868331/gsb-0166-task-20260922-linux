@@ -18,6 +18,7 @@ from tinycpu import (
     words_from_memory,
 )
 from tinycpu.pipeline import run
+from tinycpu.ooo import REORDER_WINDOW, run_out_of_order
 from tinycpu.sequential import run_sequential
 
 WIDTH = 78
@@ -168,8 +169,133 @@ def demo_precise_fault() -> None:
     print("与独立顺序参考解释器核对：故障位置与异常前内存完全一致 ✔")
 
 
+def _print_window(result) -> None:
+    print(f"周期 | {'重排序窗口（左=最老，右=最年轻；4 项）':<44} 取指→ | 事件")
+    for w in result.window:
+        cells = []
+        for i in range(REORDER_WINDOW):
+            if i < len(w.slots):
+                s = w.slots[i]
+                mark = "✓" if s.state == "done" else "·"
+                cells.append(f"{mark}pc{s.pc:<3}")
+            else:
+                cells.append("     ")
+        event = ""
+        if w.squashed:
+            event = f"冲刷回收 pc{list(w.squashed)} -> pc{w.redirect}"
+        print(f"{w.cycle:^4} | {' '.join(cells)}  {w.fetch_pc:<4} | {event}")
+    print("\n图例：✓=已完成待退休  · =执行中/等待操作数；取指→=下一条待取指令下标")
+
+
+def demo_ooo_normal() -> None:
+    _bar("演示 3（乱序核心·正常）：算术乱序完成、按序退休、分支回收年轻结果")
+    # 0 LOAD r1,0(r0)   mem[0]=5；c1 访存相位才完成
+    # 1 BEQ r1,r1,+4    等 LOAD，c2 才解析，命中 -> pc5；pc2/pc3 在此前抢跑
+    # 2 ADDI r5,r0,99   c1 整数口抢跑完成（推测结果 99）
+    # 3 ADDI r6,r0,88   c2 抢跑完成（推测结果 88）；c2 还会顺序补取 pc4
+    # 4 ADDI r7,r0,5    c2 刚补取即随分支冲刷（未完成）
+    # 5 ADDI r9,r0,7    分支目标（冲刷后重新取指）
+    # 6 ADD r4,r1,r9    5+7=12
+    # 7 STORE r4,0(r0)  存 12 到 mem[0]
+    # 8 HALT
+    prog = [
+        Instruction.load(1, 0, 0),
+        Instruction.beq(1, 1, 4),
+        Instruction.addi(5, 0, 99),
+        Instruction.addi(6, 0, 88),
+        Instruction.addi(7, 0, 5),
+        Instruction.addi(9, 0, 7),
+        Instruction.add(4, 1, 9),
+        Instruction.store(4, 0, 0),
+        Instruction.halt(),
+    ]
+    _print_program(prog)
+    ooo = run_out_of_order(prog, bytearray(memory_from_words([5])))
+    seq = run_sequential(prog, bytearray(memory_from_words([5])))
+
+    print("\n每周期重排序窗口：")
+    _print_window(ooo)
+
+    print("\n乱序完成记录（执行口实际服务顺序，可能与程序序不同）：")
+    for c in ooo.completions:
+        tail = "（被分支回收，不退休）" if c.squashed else ""
+        extra = ""
+        if c.kind == "alu" or c.kind == "load":
+            extra = f"值={c.value}"
+        elif c.kind == "branch":
+            extra = "命中" if c.taken else "不命中"
+        elif c.kind == "store":
+            extra = f"地址={c.addr} 值={c.value}"
+        print(f"  周期{c.cycle:>2}  pc{c.pc:<2} {c.op.name:<5} {extra}{tail}")
+
+    print("\n退休轨迹（严格按程序序）：")
+    for t in ooo.trace:
+        if t.rd is not None:
+            status = f"r{t.rd} <- {t.value}"
+        elif t.addr is not None:
+            status = f"mem[{t.addr}] <- {t.mem_value}"
+        elif t.op.name == "HALT":
+            status = "停机"
+        else:
+            status = "分支/无写"
+        print(f"  周期{t.cycle:>2}  pc{t.pc:<2} {t.op.name:<5} {status}")
+
+    print(f"\n最终：r1={ooo.regs[1]} r4={ooo.regs[4]} r9={ooo.regs[9]} "
+          f"mem={words_from_memory(ooo.memory)}（期望 5/12/7/[12]）")
+    print(f"被回收的年轻结果：r5={ooo.regs[5]} r6={ooo.regs[6]} r7={ooo.regs[7]}"
+          f"（期望全 0，其中 99/88 曾真实算出后随标签回收）")
+    print(f"总周期 {ooo.cycles_used}；退休序列 {[t.pc for t in ooo.trace]}")
+    assert ooo.regs == seq.regs and ooo.memory == seq.memory
+    assert [t.pc for t in ooo.trace] == [t.pc for t in seq.trace]
+    print("与独立顺序参考解释器逐退休核对：寄存器/内存/退休序列完全一致 ✔")
+
+
+def demo_ooo_fault() -> None:
+    _bar("演示 4（乱序核心·异常边界）：非法访存到退休才报告，年轻结果全丢弃")
+    # 0 ADDI r1,r0,3   非对齐基址
+    # 1 LOAD r2,0(r1)  非法（执行期识别，退休期报告）
+    # 2 ADDI r3,r0,42  与故障无关：会先乱序完成，但故障时随窗口回收
+    # 3 STORE r3,0(r0) 年轻 STORE：顺序访存使其根本没执行
+    # 4 HALT
+    prog = [
+        Instruction.addi(1, 0, 3),
+        Instruction.load(2, 1, 0),
+        Instruction.addi(3, 0, 42),
+        Instruction.store(3, 0, 0),
+        Instruction.halt(),
+    ]
+    _print_program(prog)
+    mem = memory_from_words([1234])
+    ooo = run_out_of_order(prog, bytearray(mem))
+    seq = run_sequential(prog, bytearray(mem))
+
+    print("\n乱序完成记录：")
+    for c in ooo.completions:
+        print(f"  周期{c.cycle:>2}  pc{c.pc:<2} {c.op.name:<5} "
+              f"{'地址非法(不触碰内存)' if c.bad else (f'值={c.value}')}")
+    print(f"\n故障 {ooo.fault.value}：pc{ooo.fault_pc}，报告于退休周期 "
+          f"{ooo.fault_cycle}；退休序列 {[t.pc for t in ooo.trace]}")
+    print(f"内存保持 {words_from_memory(ooo.memory)}（年轻 STORE 未写）；"
+          f"r2={ooo.regs[2]} r3={ooo.regs[3]}（乱序结果未退休，全 0）")
+    assert ooo.fault_pc == seq.fault_pc and ooo.memory == bytes(mem)
+    print("与独立顺序参考解释器核对：故障位置与异常前内存一致 ✔")
+
+
+def demo_ooo_bad_window() -> None:
+    _bar("演示 5（乱序核心·输入拒绝）：window 参数非法时无半更新")
+    mem = bytearray(memory_from_words([0]))
+    snapshot = bytes(mem)
+    for bad in (0, 99, True):
+        try:
+            run_out_of_order([Instruction.halt()], mem, window=bad)
+        except Exception as exc:
+            print(f"window={bad!r:<5} -> {type(exc).__name__}: {exc}")
+    assert bytes(mem) == snapshot
+    print("错误均在第一个周期之前抛出；调用方内存未被修改。")
+
+
 def demo_input_rejection() -> None:
-    _bar("演示 3（输入拒绝）：bool 冒充整数 / NaN 立即数，可定位错误")
+    _bar("演示 6（输入拒绝）：bool 冒充整数 / NaN 立即数，可定位错误")
 
     try:
         Instruction.add(True, 1, 2)  # noqa: FBT003 - 故意传入 bool
@@ -195,9 +321,15 @@ def main() -> None:
     print()
     demo_precise_fault()
     print()
+    demo_ooo_normal()
+    print()
+    demo_ooo_fault()
+    print()
+    demo_ooo_bad_window()
+    print()
     demo_input_rejection()
     print("=" * WIDTH)
-    print("演示结束：全部为真实计算，结果由 tinycpu 五级流水核心当场产生。")
+    print("演示结束：全部为真实计算，结果由 tinycpu 顺序/乱序核心当场产生。")
 
 
 if __name__ == "__main__":
