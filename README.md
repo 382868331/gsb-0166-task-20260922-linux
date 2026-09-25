@@ -1,9 +1,11 @@
-# tinycpu —— 精确异常的五级流水线 CPU 模拟模块
+# tinycpu —— 精确异常与显式中断的五级流水线 CPU 模拟模块
 
 一个教学用、可导入的 32 位小 CPU 周期精确内核：实现 IF/ID/EX/MEM/WB 五级
-流水线、EX 级操作数前递、load-use 停顿、分支冲刷，以及**精确异常**
-（非法访存延迟到 WB 才报告，年轻指令不得提交，老指令正常退休）。
-另附一个**独立**的无流水顺序参考解释器，用于交叉验证。
+流水线、EX 级操作数前递、load-use 停顿、分支冲刷、**精确异常**
+（非法访存延迟到 WB 才报告，年轻指令不得提交，老指令正常退休），以及
+**显式中断请求与 IRET**（退休边界接纳、保存下一条未退休指令的 PC、
+冲刷年轻指令、屏蔽嵌套直到 IRET）。另附一个**独立**的无流水顺序参考
+解释器，用于在相同退休边界注入事件做交叉验证。
 
 仅使用 Python 3.14.7 标准库，零第三方依赖，完全离线运行。
 
@@ -16,10 +18,11 @@
 在本目录（含 `tinycpu/`、`tests/`、`demo.py` 的目录）执行：
 
 ```bash
-# 必要测试（39 个用例，含 700 个确定性随机程序的差分测试）
+# 必要测试（55 个用例，含 700 个确定性随机程序的差分测试与中断差分/模糊测试）
 python -m unittest discover -s tests -v
 
 # 固定输入演示：正常结果（含气泡/冲刷）+ 实际触发的异常边界 + 输入拒绝
+#              + 中断正常路径 + 异常与中断同拍边界
 python demo.py
 ```
 
@@ -39,6 +42,9 @@ python demo.py
 | `STORE rs2, imm(rs1)` | 同上；写 32 位小端字（在 **WB** 级提交） |
 | `BEQ rs1, rs2, off` | `off` 以**字（指令）**为单位，目标 = 当前 pc + off |
 | `HALT` | 停机，程序必须以 HALT 结尾 |
+| `IRET` | 中断返回：恢复接纳时保存的 PC，随后解除中断屏蔽（无中断上下文时为空操作） |
+
+IRET 是新增的唯一一条指令；既有七条指令的编码、字段与语义完全不变。
 
 指令对象通过构造器创建（非法字段在构造时即拒绝）：
 
@@ -50,17 +56,20 @@ Instruction.load(4, 1, 8)         # LOAD r4, 8(r1)
 Instruction.store(2, 1, 0)        # STORE r2, 0(r1)
 Instruction.beq(1, 2, 3)          # BEQ r1, r2, +3
 Instruction.halt()
+Instruction.iret()                # IRET（中断返回）
 ```
 
 ## 公开接口
 
-### `tinycpu.run(instructions, memory, initial_regs=None) -> RunResult`
+### `tinycpu.run(instructions, memory, initial_regs=None, *, interrupts=None, interrupt_vector=None) -> RunResult`
 
 五级流水线执行直到 HALT 退休、非法访存在 WB 报告，或周期预算耗尽。
 
 - `instructions`：`Instruction` 序列，1–200 条，最后一条必须是 `HALT`
 - `memory`：非空、长度为 4 的倍数的 `bytes/bytearray`
 - `initial_regs`：可选，长度 32 的 32 位无符号整数序列，`r0` 必须为 0
+- `interrupts` / `interrupt_vector`：可选，**必须同时提供**；启用显式中断
+  （见下文"中断与 IRET"）。非法向量在任何周期执行之前拒绝注入
 
 返回 `RunResult`（不可变）：
 
@@ -72,16 +81,70 @@ Instruction.halt()
 | `cycles` | `CycleSlots` 序列，每周期 5 个 `Slot`（IF/ID/EX/MEM/WB） |
 | `halted` | 是否由 HALT 正常结束 |
 | `fault` / `fault_pc` / `fault_cycle` | 异常类型（仅 `Fault.ADDR`）、指令下标、报告周期 |
+| `irq_events` | `IrqEvent` 序列：每次中断接纳的边界、保存 PC、向量 PC、周期 |
+| `irq_pending` / `irq_masked` | 运行结束时控制器的 pending 位与屏蔽状态 |
 
 `Slot(index, bubble, reason)`：`reason` 取 `None`/`"drain"`（启动排空）/
 `"stall"`（load-use 气泡，沿 EX→MEM→WB 传播）/`"hold"`（停顿冻结 IF/ID）/
-`"flush"`（分支冲刷）/`"take"`（分支命中的 EX 槽）/`"fault"`（故障丢弃/报告）。
+`"flush"`（分支冲刷）/`"take"`（分支命中的 EX 槽）/`"fault"`（故障丢弃/报告）/
+`"irq"`（中断接纳冲刷的年轻指令）/`"iret"`（IRET 改向的 EX 槽）。
 
-### `tinycpu.run_sequential(instructions, memory, initial_regs=None) -> SeqResult`
+## 中断与 IRET
+
+中断系统由三部分组成：`InterruptController`（离线控制器）、固定向量 PC、
+`IRET` 指令。**既有指令编码不变**，未启用中断时行为与原模型逐位一致。
+
+### `tinycpu.InterruptController(pulse_boundaries=())`
+
+离线中断控制器模型：纯软件状态机，**不连接真实 CPU**，由执行器在每个
+退休边界步进。
+
+- `request()`：到达一个请求脉冲，把 pending 置 1。pending 只有 **1 位**：
+  多个脉冲合并，不计数；未被接纳前一直保持。
+- `pulse_boundaries`：构造时给出的退休边界下标（0 起）集合，执行器在第 k
+  次退休的边界上自动到达一个脉冲。流水线与顺序参考用**同一个边界编号**
+  注入，因此两侧注入点对齐、结果可逐位比较（测试即如此差分）。
+- `pending` 属性可随时读取；运行结束后也可从结果的 `irq_pending` 观察。
+
+### 语义契约（流水线与顺序参考完全一致）
+
+1. **接纳点**：只在退休边界评估——当前最老指令在 WB **正常退休之后**。
+2. **保存 PC**：接纳时保存"下一条尚未退休指令的 PC"（流水线中最老的
+   在役年轻指令：MEM→EX→ID→IF→取指指针），记录进 `IrqEvent.saved_pc`。
+3. **冲刷**：全部更年轻指令被冲刷（槽位标记 `"irq"`），PC 转向固定向量。
+   被冲刷的 STORE 不可能已写内存（内存写只在 WB 提交点发生）。
+4. **屏蔽**：接纳即屏蔽嵌套中断；屏蔽期间的请求仍锁存进 pending（1 位）。
+5. **IRET**：在 EX 级恢复保存的 PC（冲刷两条年轻指令，同分支）；屏蔽在
+   IRET **退休之后**才解除——IRET 自己的退休边界仍按屏蔽评估，最早下一
+   个边界才可再次接纳。无中断上下文的 IRET 是空操作。
+6. **异常优先**：同一边界有同步访存异常时，报 `ADDR` 并停机，中断保持
+   pending（可从 `irq_pending` 观察到），不接纳。
+7. **HALT**：HALT 退休后不再接纳中断；pending 保持。
+8. **非法向量**：向量必须是落在程序下标范围内的整数，否则在任何周期
+   执行之前抛 `ProgramError`/`TypeError`，拒绝注入，不产生部分状态。
+
+### 处理器（handler）的放置
+
+程序仍须以 `HALT` 结尾（静态契约未变），因此处理器放在程序**中部**，
+主程序用一条 `BEQ r0, r0, +k` 跳过它；向量指向处理器第一条指令，
+处理器以 `IRET` 结束。`tests/test_interrupt.py` 的 `build()` 即此布局。
+
+### `tinycpu.IrqEvent`
+
+| 字段 | 含义 |
+|---|---|
+| `boundary` | 第几次退休（0 起）之后接纳，可直接索引退休轨迹 |
+| `saved_pc` | 保存的"下一条尚未退休指令"的 PC（IRET 回到这里） |
+| `vector_pc` | 转向的固定向量 PC |
+| `cycle` | 流水线中的接纳周期；顺序参考无周期概念，为 `None` |
+
+### `tinycpu.run_sequential(instructions, memory, initial_regs=None, *, interrupts=None, interrupt_vector=None) -> SeqResult`
 
 独立顺序参考解释器（`tinycpu/sequential.py`）。**不导入、不调用流水线核心**，
-语义独立实现，共享的只有 `isa.py` 里的指令格式与静态校验。用于得到
-独立期望值：最终寄存器、异常前内存、逐条架构效果。
+语义独立实现，共享的只有 `isa.py` 里的指令格式与静态校验、以及
+`interrupt.py` 的控制器/事件类型。用于得到独立期望值：最终寄存器、
+异常前内存、逐条架构效果、中断事件。中断参数与 `run` 完全同义，
+注入按**相同退休边界编号**发生，因此两侧 `irq_events` 逐点可比。
 
 ### 错误与异常
 
@@ -89,7 +152,7 @@ Instruction.halt()
 |---|---|
 | `TypeError` | 参数类型错，如 `bool` 冒充 `int`、`float` 传入整数字段 |
 | `ValueError` | 数值非法：NaN/Infinity、寄存器号越界、立即数超出 32 位等 |
-| `tinycpu.ProgramError`（`ValueError` 子类） | 程序层面非法：不以 HALT 结尾、条数超界、BEQ 静态目标越界、内存非对齐/为空、r0 初值非零 |
+| `tinycpu.ProgramError`（`ValueError` 子类） | 程序层面非法：不以 HALT 结尾、条数超界、BEQ 静态目标越界、内存非对齐/为空、r0 初值非零、非法中断向量、控制器/向量只给其一 |
 | `tinycpu.CycleLimitError` | 跑满 2000 周期未结束（**预算耗尽**，与"触发故障/证明无解"严格区分） |
 
 所有静态错误在第一条指令执行前抛出，不会产生部分状态；调用方传入的
@@ -138,18 +201,25 @@ tinycpu/__init__.py     公开接口导出
 tinycpu/isa.py          指令/常量/校验/内存辅助/错误类型
 tinycpu/pipeline.py     五级流水线周期内核（被测核心）
 tinycpu/sequential.py   独立顺序参考解释器（不依赖 pipeline）
+tinycpu/interrupt.py    离线中断控制器 / IrqEvent / 中断参数校验
 tests/test_inputs.py    输入校验与错误语义
 tests/test_pipeline.py  流水线时序：停顿/前递/冲刷/精确异常/上限
 tests/test_equivalence.py  与顺序参考的差分测试（700 个确定性随机程序）
+tests/test_interrupt.py 中断：接纳/保存PC/冲刷/屏蔽/异常优先/非法向量/差分
 demo.py                 固定输入演示
 ```
 
 ## 已知限制
 
-- 只实现题目规定的 7 条指令，不是完整 RISC-V/MIPS 行业标准实现，不做此类宣称。
+- 只实现题目规定的 7 条指令加 IRET，不是完整 RISC-V/MIPS 行业标准实现，不做此类宣称。
 - 无指令内存/取指异常概念；指令以下标数组给出，不做取指地址翻译。
-- 只有一种异常：数据访存地址错（非对齐或越界）；没有中断、系统调用、
+- 只有一种异常：数据访存地址错（非对齐或越界）；没有系统调用、
   除零、溢出异常（加减法按模回绕，不视为异常）。
+- 中断为单一固定向量、1 位 pending（多脉冲合并，不计数）、无优先级/
+  无嵌套计数；IRET 无中断上下文时为空操作；控制器是离线软件模型，
+  不连接真实 CPU/操作系统。
+- 程序仍须以 HALT 结尾，故中断处理器须放在程序中部、由主程序跳过
+  （见"中断与 IRET"一节）。
 - BEQ 目标静态校验落在程序内；后向分支死循环由 2000 周期预算截断为
   `CycleLimitError`，这是预算限制而非程序故障。
 - 内存上限 1 MiB 为本实现的固定边界（题目未规定数据内存大小）。

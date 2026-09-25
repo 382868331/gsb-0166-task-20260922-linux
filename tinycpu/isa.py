@@ -26,7 +26,12 @@ IMM_MAX = (1 << 31) - 1
 
 
 class Op(str, Enum):
-    """七条指令。枚举值同时是对外可见的规范短名。"""
+    """八条指令。枚举值同时是对外可见的规范短名。
+
+    IRET 为中断返回：恢复接纳中断时保存的 PC，然后解除中断屏蔽
+    （见 :mod:`tinycpu.interrupt`）。它不占用任何操作数字段，
+    既有七条指令的编码与语义完全不变。
+    """
 
     ADD = "ADD"
     SUB = "SUB"
@@ -35,6 +40,7 @@ class Op(str, Enum):
     STORE = "STORE"
     BEQ = "BEQ"
     HALT = "HALT"
+    IRET = "IRET"
 
 
 class Fault(str, Enum):
@@ -55,6 +61,7 @@ LOAD = Op.LOAD
 STORE = Op.STORE
 BEQ = Op.BEQ
 HALT = Op.HALT
+IRET = Op.IRET
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +142,7 @@ class Instruction:
     STORE -      基址    存数    字节偏移（符号加）
     BEQ  -       源 1    源 2    字偏移（PC 相对，符号）
     HALT -       -       -       -
+    IRET -       -       -       -
     ==== ======= ======= ======= =========================
 
     BEQ 的 ``imm`` 以**字**为单位：目标指令下标 = 当前 pc + imm。
@@ -206,6 +214,10 @@ class Instruction:
     def halt(cls) -> "Instruction":
         return cls(Op.HALT)
 
+    @classmethod
+    def iret(cls) -> "Instruction":
+        return cls(Op.IRET)
+
     # -- 译码后属性 ---------------------------------------------------------
 
     @property
@@ -225,7 +237,7 @@ class Instruction:
         if self.op == Op.BEQ:
             sign = "+" if self.imm >= 0 else ""
             return f"BEQ r{self.rs1}, r{self.rs2}, {sign}{self.imm}"
-        return "HALT"
+        return self.op.value  # HALT / IRET
 
 
 # ---------------------------------------------------------------------------

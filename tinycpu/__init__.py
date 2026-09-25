@@ -8,6 +8,7 @@ from .isa import (
     ADDI,
     BEQ,
     HALT,
+    IRET,
     LOAD,
     STORE,
     SUB,
@@ -23,6 +24,7 @@ from .isa import (
     memory_from_words,
     words_from_memory,
 )
+from .interrupt import InterruptController, IrqEvent
 from .pipeline import (
     CycleSlots,
     CycleLimitError,
@@ -38,6 +40,7 @@ __all__ = [
     "ADDI",
     "BEQ",
     "HALT",
+    "IRET",
     "LOAD",
     "STORE",
     "SUB",
@@ -52,6 +55,8 @@ __all__ = [
     "TinyCPUError",
     "memory_from_words",
     "words_from_memory",
+    "InterruptController",
+    "IrqEvent",
     "CycleSlots",
     "CycleLimitError",
     "RetireRecord",

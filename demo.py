@@ -7,13 +7,17 @@
    打印每周期流水槽、退休轨迹，并与独立顺序参考解释器核对；
 2. 异常边界：分支冲刷后紧跟非法 STORE，验证"非法访存到 WB 才报告、
    年轻 STORE 不写内存、老指令正常提交"；
-3. 输入拒绝：bool 冒充寄存器号被可定位地拒绝。
+3. 输入拒绝：bool 冒充寄存器号被可定位地拒绝；
+4. 中断正常路径：退休边界接纳、保存 PC、冲刷年轻 STORE（处理器读到
+   旧内存值）、IRET 返回后重执行；
+5. 中断边界：异常与中断同拍——异常优先，中断保持 pending。
 """
 
 from __future__ import annotations
 
 from tinycpu import (
     Instruction,
+    InterruptController,
     memory_from_words,
     words_from_memory,
 )
@@ -42,6 +46,10 @@ def _cell(slot) -> str:
             if slot.index is not None:
                 return f" ~flush{slot.index}"
             return " ~flush "
+        if slot.reason == "irq":
+            if slot.index is not None:
+                return f" ~irq{slot.index:<3}"
+            return "  ~irq  "
         if slot.reason == "hold":
             return f" hold{slot.index:<3}"
         if slot.reason == "fault":
@@ -49,6 +57,8 @@ def _cell(slot) -> str:
         if slot.reason == "take":
             return f" take{slot.index:<3}"
         return "   ·    "
+    if slot.reason == "iret":
+        return f" iret{slot.index:<3}"
     return f" i{slot.index:<6}"
 
 
@@ -62,7 +72,8 @@ def _print_cycles(result, limit: int | None = None) -> None:
         print(f"...（共 {len(result.cycles)} 周期，以下省略）...")
     print(
         "\n图例：iN=指令N   · =启动/排空气泡   ~stall=load-use 气泡\n"
-        "      holdN=停顿冻结   ~flushN=分支冲刷受害者N   faultN=故障丢弃N   takeN=分支命中"
+        "      holdN=停顿冻结   ~flushN=分支冲刷受害者N   faultN=故障丢弃N   takeN=分支命中\n"
+        "      ~irqN=中断冲刷受害者N   iretN=IRET 改向"
     )
 
 
@@ -190,12 +201,86 @@ def demo_input_rejection() -> None:
     print("以上错误均在任何周期执行之前抛出，无部分状态。")
 
 
+def demo_interrupt() -> None:
+    _bar("演示 4（中断正常路径）：退休边界接纳、保存 PC、冲刷年轻 STORE、IRET 返回")
+    # 布局：pc0 跳过处理器；处理器 pc1-pc2；主程序 pc3 起。
+    prog = [
+        Instruction.beq(0, 0, 3),       # pc0  跳过处理器 -> pc3
+        Instruction.load(6, 0, 0),      # pc1  处理器：读被冲刷 STORE 的地址（向量 pc=1）
+        Instruction.iret(),             # pc2  恢复保存的 PC，随后解除屏蔽
+        Instruction.addi(5, 0, 111),    # pc3  r5 = 111
+        Instruction.store(5, 0, 0),     # pc4  接纳时在 MEM 级，被冲刷，不得写！
+        Instruction.store(6, 0, 4),     # pc5  把处理器读到的值存到 mem[4]
+        Instruction.halt(),             # pc6
+    ]
+    _print_program(prog)
+
+    mem = memory_from_words([0, 0])
+    # 离线控制器：在第 1 个退休边界（pc3 退休后）到达一个请求脉冲。
+    pipe = run(prog, bytearray(mem),
+               interrupts=InterruptController(pulse_boundaries={1}),
+               interrupt_vector=1)
+    seq = run_sequential(prog, bytearray(mem),
+                         interrupts=InterruptController(pulse_boundaries={1}),
+                         interrupt_vector=1)
+
+    print("\n每周期流水槽：")
+    _print_cycles(pipe)
+
+    ev = pipe.irq_events[0]
+    print(f"\n中断事件：第 {ev.boundary} 次退休（周期 {ev.cycle}）后接纳；"
+          f"保存 PC={ev.saved_pc}（下一条尚未退休指令 pc4 的 STORE）；转向向量 pc{ev.vector_pc}")
+    print(f"退休序列：{[t.pc for t in pipe.trace]}")
+    out = words_from_memory(pipe.memory)
+    print(f"处理器在 pc1 读到 r6={pipe.regs[6]}（期望 0：被冲刷的 pc4 STORE 没写内存）")
+    print(f"最终内存字：{out}（mem[0]=111 是 IRET 返回后 pc4 重新执行写入；mem[4]=0）")
+    assert pipe.regs == seq.regs and pipe.memory == seq.memory
+    assert [t.pc for t in pipe.trace] == [t.pc for t in seq.trace]
+    assert [(e.boundary, e.saved_pc) for e in pipe.irq_events] == \
+           [(e.boundary, e.saved_pc) for e in seq.irq_events]
+    print("与独立顺序参考（同一边界注入）核对：寄存器 / 内存 / 退休序列 / 中断事件一致 ✔")
+
+
+def demo_interrupt_fault_priority() -> None:
+    _bar("演示 5（实际边界）：异常与中断同拍 —— 异常优先，中断仍待处理")
+    prog = [
+        Instruction.beq(0, 0, 2),       # pc0  跳过处理器 -> pc2
+        Instruction.iret(),             # pc1  处理器（向量 pc=1，本演示不会进入）
+        Instruction.addi(1, 0, 3),      # pc2  r1 = 3（非对齐基址）
+        Instruction.load(2, 1, 0),      # pc3  非法 LOAD -> WB 报 ADDR
+        Instruction.store(2, 0, 0),     # pc4  年轻 STORE，禁止写
+        Instruction.halt(),             # pc5
+    ]
+    _print_program(prog)
+
+    mem = memory_from_words([9, 9])
+    # 脉冲恰好落在故障边界（pc3 是第 2 次退休）。
+    ctrl = InterruptController(pulse_boundaries={2})
+    pipe = run(prog, bytearray(mem), interrupts=ctrl, interrupt_vector=1)
+    seq = run_sequential(prog, bytearray(mem),
+                         interrupts=InterruptController(pulse_boundaries={2}),
+                         interrupt_vector=1)
+
+    print(f"\n故障：{pipe.fault.value}，故障指令 pc{pipe.fault_pc}，报告于周期 {pipe.fault_cycle}")
+    print(f"中断接纳事件：{list(pipe.irq_events)}（空 = 异常优先，本边界未接纳）")
+    print(f"运行结束后 pending={pipe.irq_pending}（请求保持待处理，未被丢弃）")
+    print(f"内存字：{words_from_memory(pipe.memory)}（故障 STORE 与年轻 STORE 均未写）")
+    assert pipe.irq_events == () and pipe.irq_pending
+    assert pipe.memory == seq.memory and pipe.fault_pc == seq.fault_pc
+    assert seq.irq_pending
+    print("与独立顺序参考核对：故障位置、异常前内存、pending 状态完全一致 ✔")
+
+
 def main() -> None:
     demo_normal()
     print()
     demo_precise_fault()
     print()
     demo_input_rejection()
+    print()
+    demo_interrupt()
+    print()
+    demo_interrupt_fault_priority()
     print("=" * WIDTH)
     print("演示结束：全部为真实计算，结果由 tinycpu 五级流水核心当场产生。")
 

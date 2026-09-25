@@ -1,15 +1,20 @@
-"""五级流水线周期内核（IF/ID/EX/MEM/WB），带精确异常语义。
+"""五级流水线周期内核（IF/ID/EX/MEM/WB），带精确异常与显式中断语义。
 
 时序约定（每个周期）：
   1. WB  退休/提交：寄存器写、STORE 内存写、HALT、非法访存报告都在这里；
+         中断也只在退休边界评估——最老指令正常退休后接纳，保存下一条
+         尚未退休指令的 PC，冲刷全部年轻指令，转向固定向量；
   2. MEM LOAD 读内存（地址非法时不实际访问，数据置 0，等 WB 报告）；
   3. EX  ALU、地址计算、BEQ 决策（命中则冲刷 ID/IF 两条年轻指令）；
+         IRET 在此恢复保存的 PC（屏蔽到 IRET 退休才解除）；
   4. ID  读寄存器（本周期 WB 先写后读）、load-use 冒险检测；
   5. IF  取指。
 
 关键性质：
 * 所有架构状态变更（寄存器写、内存写、HALT、fault）只在 WB 发生，
   因此 WB 报告非法访存时，同周期 MEM 里更年轻的 STORE 一定还没写内存；
+* 同一边界异常与中断同时出现时异常优先，中断保持 pending；
+* 被中断冲刷的 STORE 不可能已写内存（写内存只在 WB）；
 * load-use：EX 里是 LOAD、ID 里的指令要用其 rd 时，冻结 PC 与 IF/ID，
   向 EX 插入一个气泡；
 * 前递：EX 取操作数时 MEM 锁存器（最新）优先，其次 WB 锁存器，
@@ -31,6 +36,7 @@ from .isa import (
     Op,
     validate_program,
 )
+from .interrupt import InterruptController, IrqEvent, check_interrupt_setup
 
 # ---------------------------------------------------------------------------
 # 对外数据结构
@@ -102,6 +108,10 @@ class RunResult:
     fault: Optional[Fault]
     fault_pc: Optional[int]
     fault_cycle: Optional[int]
+    # 中断：接纳事件（含保存 PC）、运行结束时的 pending/屏蔽状态。
+    irq_events: tuple[IrqEvent, ...] = ()
+    irq_pending: bool = False
+    irq_masked: bool = False
 
     @property
     def cycles_used(self) -> int:
@@ -140,10 +150,18 @@ def run(
     instructions: list[Instruction] | tuple[Instruction, ...],
     memory: bytes | bytearray,
     initial_regs: Optional[list[int]] = None,
+    *,
+    interrupts: Optional[InterruptController] = None,
+    interrupt_vector: Optional[int] = None,
 ) -> RunResult:
     """跑五级流水线直到 HALT 退休、非法访存报告或周期预算耗尽。
 
     参数静态校验全部在第一条指令执行前完成，失败不会产生任何部分结果。
+
+    中断（可选）：``interrupts`` 与 ``interrupt_vector`` 必须同时提供。
+    控制器是离线模型，由本内核在每个退休边界步进；向量是固定的程序
+    下标，非法向量在任何周期执行之前拒绝注入。接纳、保存 PC、屏蔽与
+    IRET 的语义见 :mod:`tinycpu.interrupt` 的模块契约。
 
     Raises:
         TypeError/ValueError/ProgramError: 输入不合法。
@@ -151,6 +169,7 @@ def run(
     """
     prog, mem, regs = validate_program(instructions, memory, initial_regs)
     n = len(prog)
+    vector = check_interrupt_setup(interrupts, interrupt_vector, n)
 
     if_id = _Latch()
     id_ex = _Latch()
@@ -166,9 +185,14 @@ def run(
     fault_pc: Optional[int] = None
     fault_cycle: Optional[int] = None
 
+    irq_events: list[IrqEvent] = []
+    irq_masked = False
+    irq_saved_pc: Optional[int] = None
+
     for cycle in range(1, MAX_CYCLES + 1):
         # 本周期控制信号
         wb_fault_this_cycle = False
+        irq_taken = False
         stall = False
         flush = False
         flush_victim_id: Optional[int] = None
@@ -196,6 +220,7 @@ def run(
 
         # ==============================================================
         # 1) WB：退休。所有架构提交只发生在这里。
+        #    中断也只在退休边界评估：最老指令正常退休之后才接纳。
         # ==============================================================
         if mem_wb.valid:
             w = mem_wb.insn
@@ -203,6 +228,7 @@ def run(
             if w.op in (Op.LOAD, Op.STORE) and mem_wb.bad_addr:
                 # 非法访存到 WB 才报告：本指令不提交，
                 # 同周期 MEM/EX/ID/IF 全部更年轻，一律不提交。
+                # 异常优先于中断：脉冲到达（保持 pending），本边界不接纳。
                 wb_fault_this_cycle = True
                 fault = Fault.ADDR
                 fault_pc = mem_wb.pc
@@ -210,6 +236,8 @@ def run(
                 trace.append(
                     RetireRecord(cycle=cycle, pc=mem_wb.pc, op=w.op, fault=Fault.ADDR)
                 )
+                if interrupts is not None:
+                    interrupts._arrive(len(trace) - 1)
                 slot_wb = Slot("WB", mem_wb.pc, bubble=False, reason="fault")
             else:
                 rec_kwargs: dict = {"cycle": cycle, "pc": mem_wb.pc, "op": w.op}
@@ -229,12 +257,37 @@ def run(
                     halted = True
                 trace.append(RetireRecord(**rec_kwargs))
 
+                if interrupts is not None:
+                    interrupts._arrive(len(trace) - 1)
+                    # 接纳：pending 且未屏蔽；HALT 退休后不再接纳。
+                    # 保存"下一条尚未退休指令"的 PC，冲刷全部年轻指令。
+                    if (
+                        w.op != Op.HALT
+                        and interrupts.pending
+                        and not irq_masked
+                    ):
+                        irq_taken = True
+                        irq_saved_pc = _next_retire_pc(ex_mem, id_ex, if_id, pc)
+                        irq_events.append(
+                            IrqEvent(
+                                boundary=len(trace) - 1,
+                                saved_pc=irq_saved_pc,
+                                vector_pc=vector,
+                                cycle=cycle,
+                            )
+                        )
+                        irq_masked = True
+                        interrupts._take()
+                    # IRET 退休后才解除屏蔽（本边界仍按屏蔽评估）。
+                    if w.op == Op.IRET and not irq_taken:
+                        irq_masked = False
+
         # ==============================================================
         # 2) MEM：LOAD 读内存（非法地址不触碰内存）；STORE 等到 WB 才写。
         #    （wb_fault 时 MEM 的年轻指令即使读了也不会被前递到任何会提交
         #      的指令，锁存器整体丢弃即可。）
         # ==============================================================
-        if ex_mem.valid and not wb_fault_this_cycle:
+        if ex_mem.valid and not wb_fault_this_cycle and not irq_taken:
             m = ex_mem.insn
             assert m is not None
             if m.op == Op.LOAD and not ex_mem.bad_addr:
@@ -244,7 +297,7 @@ def run(
         # ==============================================================
         # 3) EX：ALU / 地址 / 分支决策（含前递）。
         # ==============================================================
-        if id_ex.valid and not wb_fault_this_cycle:
+        if id_ex.valid and not wb_fault_this_cycle and not irq_taken:
             x = id_ex.insn
             assert x is not None
 
@@ -270,6 +323,15 @@ def run(
                     flush_victim_if = pc if pc < n else None
                     pc = id_ex.pc + x.imm  # 已静态校验落在 [0, n)
                     slot_ex = Slot("EX", id_ex.pc, bubble=False, reason="take")
+            elif x.op == Op.IRET:
+                # 中断返回：恢复保存的 PC（冲刷两条年轻指令，同分支）。
+                # 屏蔽要到 IRET 退休（WB）才解除；无中断上下文时为空操作。
+                if irq_masked and irq_saved_pc is not None:
+                    flush = True
+                    flush_victim_id = if_id.pc if if_id.valid else None
+                    flush_victim_if = pc if pc < n else None
+                    pc = irq_saved_pc
+                    slot_ex = Slot("EX", id_ex.pc, bubble=False, reason="iret")
             # HALT：EX 无动作
 
         # ==============================================================
@@ -279,6 +341,7 @@ def run(
             if_id.valid
             and id_ex.valid
             and not wb_fault_this_cycle
+            and not irq_taken
             and not flush
         ):
             d = if_id.insn
@@ -300,6 +363,16 @@ def run(
                 slot_id = Slot("ID", if_id.pc, bubble=True, reason="fault")
             if pc < n:
                 slot_if = Slot("IF", pc, bubble=True, reason="fault")
+        elif irq_taken:
+            # 中断接纳：年轻各级被冲刷，PC 转向向量（在下方下沉处生效）。
+            if ex_mem.valid:
+                slot_me = Slot("MEM", ex_mem.pc, bubble=True, reason="irq")
+            if id_ex.valid:
+                slot_ex = Slot("EX", id_ex.pc, bubble=True, reason="irq")
+            if if_id.valid:
+                slot_id = Slot("ID", if_id.pc, bubble=True, reason="irq")
+            if pc < n:
+                slot_if = Slot("IF", pc, bubble=True, reason="irq")
         elif flush:
             if flush_victim_id is not None:
                 slot_id = Slot("ID", flush_victim_id, bubble=True, reason="flush")
@@ -324,6 +397,15 @@ def run(
         # ==============================================================
         # 锁存器下沉（组合逻辑结果在本周期末打入）。
         # ==============================================================
+        if irq_taken:
+            # 中断接纳：冲刷全部年轻指令，PC 转向固定向量，下一周期重新填充。
+            mem_wb = _Latch()
+            ex_mem = _Latch()
+            id_ex = _Latch()
+            if_id = _Latch()
+            pc = vector
+            continue
+
         # WB <- MEM，MEM <- EX（整条锁存器复制）。
         mem_wb = ex_mem
         ex_mem = id_ex
@@ -369,6 +451,9 @@ def run(
         fault=fault,
         fault_pc=fault_pc,
         fault_cycle=fault_cycle,
+        irq_events=tuple(irq_events),
+        irq_pending=interrupts.pending if interrupts is not None else False,
+        irq_masked=irq_masked,
     )
 
 
@@ -379,6 +464,20 @@ def run(
 
 def _addr_ok(addr: int, mem_len: int) -> bool:
     return addr % 4 == 0 and 0 <= addr <= mem_len - 4
+
+
+def _next_retire_pc(
+    ex_mem: _Latch, id_ex: _Latch, if_id: _Latch, fetch_pc: int
+) -> int:
+    """中断接纳瞬间，"下一条尚未退休指令"的 PC。
+
+    即当前最老的在役年轻指令：MEM 级有效取 MEM，否则 EX、ID、IF，
+    流水线后方全空时取当前取指指针（下一条尚未进入流水线的指令）。
+    """
+    for lat in (ex_mem, id_ex, if_id):
+        if lat.valid:
+            return lat.pc
+    return fetch_pc
 
 
 def _uses(d: Instruction, reg: int) -> bool:
