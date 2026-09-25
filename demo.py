@@ -7,13 +7,21 @@
    打印每周期流水槽、退休轨迹，并与独立顺序参考解释器核对；
 2. 异常边界：分支冲刷后紧跟非法 STORE，验证"非法访存到 WB 才报告、
    年轻 STORE 不写内存、老指令正常提交"；
-3. 输入拒绝：bool 冒充寄存器号被可定位地拒绝。
+3. 中断正常路径：在一条 main 指令正常退休的边界注入脉冲，打印
+   "接纳 -> 保存 PC -> 冲刷年轻指令 -> 固定向量处理例程 -> IRET 恢复"
+   的完整流水槽与退休轨迹，并与顺序参考在同一退休边界注入后比较；
+4. 异常与中断同拍：故障指令 WB 报告的同一拍给脉冲，异常优先、
+   中断保持 pending；
+5. 输入拒绝：bool 冒充寄存器号、非法中断向量被可定位地拒绝。
 """
 
 from __future__ import annotations
 
 from tinycpu import (
+    BoundaryInterrupts,
     Instruction,
+    InterruptController,
+    VECTOR_PC,
     memory_from_words,
     words_from_memory,
 )
@@ -42,6 +50,10 @@ def _cell(slot) -> str:
             if slot.index is not None:
                 return f" ~flush{slot.index}"
             return " ~flush "
+        if slot.reason == "intr":
+            return f" ~intr{slot.index if slot.index is not None else '·'}"
+        if slot.reason == "iret":
+            return f" ~iret{slot.index if slot.index is not None else '·'}"
         if slot.reason == "hold":
             return f" hold{slot.index:<3}"
         if slot.reason == "fault":
@@ -49,6 +61,8 @@ def _cell(slot) -> str:
         if slot.reason == "take":
             return f" take{slot.index:<3}"
         return "   ·    "
+    if slot.reason == "take":
+        return f" take{slot.index:<3}"
     return f" i{slot.index:<6}"
 
 
@@ -62,7 +76,8 @@ def _print_cycles(result, limit: int | None = None) -> None:
         print(f"...（共 {len(result.cycles)} 周期，以下省略）...")
     print(
         "\n图例：iN=指令N   · =启动/排空气泡   ~stall=load-use 气泡\n"
-        "      holdN=停顿冻结   ~flushN=分支冲刷受害者N   faultN=故障丢弃N   takeN=分支命中"
+        "      holdN=停顿冻结   ~flushN=分支冲刷受害者N   faultN=故障丢弃N\n"
+        "      takeN=分支命中   ~intrN=中断接纳冲刷N   ~iretN=IRET 冲刷N"
     )
 
 
@@ -168,8 +183,122 @@ def demo_precise_fault() -> None:
     print("与独立顺序参考解释器核对：故障位置与异常前内存完全一致 ✔")
 
 
+def _trace_line(t) -> str:
+    extra = ""
+    if t.fault:
+        extra = f"故障 {t.fault.value}（不提交）"
+    elif t.rd is not None:
+        extra = f"r{t.rd} <- {t.value}"
+    elif t.addr is not None:
+        extra = f"mem[{t.addr}] <- {t.mem_value}"
+    elif t.op.name == "HALT":
+        extra = "停机"
+    else:
+        extra = "（无架构写）"
+    if t.event == "INTR":
+        extra += f"  ◀ 接纳中断：保存 pc{t.saved_pc}，转向量 pc{VECTOR_PC}"
+    elif t.event == "IRET":
+        extra += f"  ◀ IRET：恢复 pc{t.saved_pc}，解除屏蔽"
+    return f"  周期{t.cycle:>2}  pc{t.pc:<2} {t.op.name:<5} {extra}"
+
+
+def demo_interrupt_normal() -> None:
+    _bar("演示 3（中断正常路径）：退休边界接纳、保存 PC、冲刷、IRET 恢复")
+    # 固定向量 VECTOR_PC=0。冷启动也从 pc0 起，用 r30 区分两种进入：
+    #   冷启动 r30=1 走 pc1 跳过例程；中断进入时 r30=0 落入 pc2 例程。
+    prog = [
+        Instruction.beq(30, 0, 2),       # pc0 中断入口 -> pc2
+        Instruction.beq(0, 0, 3),        # pc1 冷启动 -> pc4
+        Instruction.addi(20, 20, 1),     # pc2 处理例程：r20 += 1
+        Instruction.iret(),              # pc3 IRET：恢复保存 PC
+        Instruction.addi(30, 0, 0),      # pc4 main：清冷启动标志
+        Instruction.addi(1, 0, 40),      # pc5 基址
+        Instruction.addi(2, 0, 3),       # pc6
+        Instruction.load(4, 1, 0),       # pc7 r4 = mem[40]
+        Instruction.add(5, 4, 2),        # pc8 load-use（停一拍）
+        Instruction.store(5, 1, 8),      # pc9 mem[48] = r5
+        Instruction.halt(),              # pc10
+    ]
+    _print_program(prog)
+    words = [0] * 13
+    words[10] = 7
+    mem = memory_from_words(words)
+    init = [0] * 32
+    init[30] = 1
+
+    # 无中断干跑：确定 pc5 退休周期与退休边界编号，两个执行器在该同一
+    # 退休边界注入脉冲（流水线按周期、顺序机按已退休指令数）。
+    dry = run(prog, bytearray(mem), init)
+    accept_cycle = next(t.cycle for t in dry.trace if t.pc == 5)
+    pcs = [t.pc for t in dry.trace]
+    accept_boundary = pcs.index(5)
+
+    ic = InterruptController().request(accept_cycle)
+    bc = BoundaryInterrupts().request_after(accept_boundary)
+    pipe = run(prog, bytearray(mem), init, ic)
+    seq = run_sequential(prog, bytearray(mem), init, bc)
+
+    print(f"\n脉冲注入周期：{accept_cycle}（pc5 正常退休的边界）")
+    print("每周期流水槽：")
+    _print_cycles(pipe)
+
+    print("\n退休轨迹（含中断接纳 / IRET 事件）：")
+    for t in pipe.trace:
+        print(_trace_line(t))
+
+    acc = pipe.interrupts[0]
+    print(
+        f"\n接纳：周期 {acc.cycle}，老指令 pc{acc.retired_pc} 正常退休，"
+        f"保存下一条尚未退休指令 pc{acc.saved_pc}；同周期 MEM/EX/ID/IF 的年轻指令"
+        "全部冲刷（~intr），下周期从 pc0 取处理例程。"
+    )
+    print(f"处理例程效果：r20 = {pipe.regs[20]}（期望 1）；main 现场保持："
+          f"r4={pipe.regs[4]} r5={pipe.regs[5]}（期望 7/10）")
+    print(f"内存 mem[48] = {words_from_memory(pipe.memory)[12]}（期望 10，"
+          "恢复后 pc9 才写入；被冲刷的年轻 STORE 不落内存）")
+    assert pipe.regs == seq.regs and pipe.memory == seq.memory
+    assert [(t.pc, t.event, t.saved_pc) for t in pipe.trace] == \
+           [(t.pc, t.event, t.saved_pc) for t in seq.trace]
+    print("与独立顺序参考（同退休边界注入）核对：寄存器/内存/退休事件序列一致 ✔")
+
+
+def demo_interrupt_vs_fault_same_cycle() -> None:
+    _bar("演示 4（实际边界）：同步访存异常与中断同一退休边界——异常优先")
+    prog = [
+        Instruction.addi(1, 0, 2),       # pc0 r1 = 2（非对齐）
+        Instruction.load(2, 1, 0),       # pc1 地址 2 非对齐 -> WB 报 ADDR
+        Instruction.addi(3, 0, 5),       # pc2 年轻，被丢弃
+        Instruction.halt(),              # pc3
+    ]
+    _print_program(prog)
+    mem = memory_from_words([123, 456])
+    dry = run(prog, bytearray(mem))
+    fault_cycle = dry.fault_cycle
+
+    # 脉冲恰在故障指令 WB 报告那一拍（周期）/同一条指令退休的边界（顺序）。
+    ic = InterruptController().request(fault_cycle)
+    bc = BoundaryInterrupts().request_after(1)  # pc1 退休前已退休 1 条
+    pipe = run(prog, bytearray(mem), interrupts=ic)
+    seq = run_sequential(prog, bytearray(mem), interrupts=bc)
+
+    print(f"\n脉冲周期 {fault_cycle} 正是 pc1 在 WB 报 ADDR 的周期。")
+    print("退休轨迹：")
+    for t in pipe.trace:
+        print(_trace_line(t))
+    print(
+        f"\n结果：fault={pipe.fault.value}（pc{pipe.fault_pc}），"
+        f"接纳次数={len(pipe.interrupts)}，中断未被消费 pending={pipe.interrupts_pending}"
+    )
+    print("机器停在故障点，未转向量 pc0；异常前内存保持："
+          f"{words_from_memory(pipe.memory)}（123/456）")
+    assert pipe.fault_pc == seq.fault_pc
+    assert pipe.interrupts == seq.interrupts == ()
+    assert pipe.interrupts_pending and seq.interrupts_pending
+    print("顺序参考同边界注入同样异常优先、pending 保持 ✔")
+
+
 def demo_input_rejection() -> None:
-    _bar("演示 3（输入拒绝）：bool 冒充整数 / NaN 立即数，可定位错误")
+    _bar("演示 5（输入拒绝）：bool 冒充整数 / NaN 立即数 / 非法中断向量")
 
     try:
         Instruction.add(True, 1, 2)  # noqa: FBT003 - 故意传入 bool
@@ -187,6 +316,11 @@ def demo_input_rejection() -> None:
         run([Instruction.halt()], memory_from_words([0]), bad_regs)
     except Exception as exc:
         print(f"r0 初值非零 -> {type(exc).__name__}: {exc}")
+
+    try:
+        InterruptController(vector=7).request(3, vector=7)
+    except ValueError as exc:
+        print(f"非法中断向量 7 -> ValueError: {exc}")
     print("以上错误均在任何周期执行之前抛出，无部分状态。")
 
 
@@ -194,6 +328,10 @@ def main() -> None:
     demo_normal()
     print()
     demo_precise_fault()
+    print()
+    demo_interrupt_normal()
+    print()
+    demo_interrupt_vs_fault_same_cycle()
     print()
     demo_input_rejection()
     print("=" * WIDTH)

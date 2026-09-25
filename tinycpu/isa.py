@@ -23,10 +23,15 @@ MAX_CYCLES = 2000
 MAX_MEMORY_BYTES = 1 << 20
 IMM_MIN = -(1 << 31)
 IMM_MAX = (1 << 31) - 1
+# 固定中断向量 PC：中断被接纳后下一条取指从该指令下标开始。
+# 不引入任何指令编码/寻址改动；约定向量为 0，使用中断的程序把处理例程
+# 放在 pc0 起，并用一条"冷启动跳过、进入处理例程时落下"的 BEQ 做引导
+# （见 README 与测试）。
+VECTOR_PC = 0
 
 
 class Op(str, Enum):
-    """七条指令。枚举值同时是对外可见的规范短名。"""
+    """八条指令。枚举值同时是对外可见的规范短名。"""
 
     ADD = "ADD"
     SUB = "SUB"
@@ -35,6 +40,7 @@ class Op(str, Enum):
     STORE = "STORE"
     BEQ = "BEQ"
     HALT = "HALT"
+    IRET = "IRET"
 
 
 class Fault(str, Enum):
@@ -55,6 +61,7 @@ LOAD = Op.LOAD
 STORE = Op.STORE
 BEQ = Op.BEQ
 HALT = Op.HALT
+IRET = Op.IRET
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +75,10 @@ class TinyCPUError(Exception):
 
 class ProgramError(TinyCPUError, ValueError):
     """程序/内存/初值静态不合法（在任何模拟状态产生之前抛出）。"""
+
+
+class InterruptStateError(TinyCPUError):
+    """中断控制状态非法：如未处于中断处理时执行了 IRET。"""
 
 
 class CycleLimitError(TinyCPUError):
@@ -174,7 +185,7 @@ class Instruction:
             object.__setattr__(self, "rs2", _check_reg("rs2", self.rs2))
             # 程序最长 200 条，13 位以上的字偏移没有合法目标可能。
             object.__setattr__(self, "imm", _check_imm("imm", self.imm))
-        # HALT：无字段需要校验。
+        # HALT/IRET：无字段需要校验。
 
     # -- 便捷构造器 ---------------------------------------------------------
 
@@ -206,6 +217,10 @@ class Instruction:
     def halt(cls) -> "Instruction":
         return cls(Op.HALT)
 
+    @classmethod
+    def iret(cls) -> "Instruction":
+        return cls(Op.IRET)
+
     # -- 译码后属性 ---------------------------------------------------------
 
     @property
@@ -225,6 +240,8 @@ class Instruction:
         if self.op == Op.BEQ:
             sign = "+" if self.imm >= 0 else ""
             return f"BEQ r{self.rs1}, r{self.rs2}, {sign}{self.imm}"
+        if self.op == Op.IRET:
+            return "IRET"
         return "HALT"
 
 

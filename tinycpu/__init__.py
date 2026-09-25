@@ -8,11 +8,14 @@ from .isa import (
     ADDI,
     BEQ,
     HALT,
+    IRET,
     LOAD,
     STORE,
     SUB,
+    VECTOR_PC,
     Fault,
     Instruction,
+    InterruptStateError,
     MASK32,
     MAX_CYCLES,
     MAX_INSTRUCTIONS,
@@ -23,6 +26,11 @@ from .isa import (
     memory_from_words,
     words_from_memory,
 )
+from .interrupt import (
+    BoundaryInterrupts,
+    InterruptAccept,
+    InterruptController,
+)
 from .pipeline import (
     CycleSlots,
     CycleLimitError,
@@ -31,18 +39,21 @@ from .pipeline import (
     Slot,
     run,
 )
-from .sequential import SeqTraceEntry, run_sequential
+from .sequential import SeqTraceEntry, SeqResult, run_sequential
 
 __all__ = [
     "ADD",
     "ADDI",
     "BEQ",
     "HALT",
+    "IRET",
     "LOAD",
     "STORE",
     "SUB",
+    "VECTOR_PC",
     "Fault",
     "Instruction",
+    "InterruptStateError",
     "MASK32",
     "MAX_CYCLES",
     "MAX_INSTRUCTIONS",
@@ -52,6 +63,9 @@ __all__ = [
     "TinyCPUError",
     "memory_from_words",
     "words_from_memory",
+    "BoundaryInterrupts",
+    "InterruptAccept",
+    "InterruptController",
     "CycleSlots",
     "CycleLimitError",
     "RetireRecord",
@@ -59,5 +73,6 @@ __all__ = [
     "Slot",
     "run",
     "SeqTraceEntry",
+    "SeqResult",
     "run_sequential",
 ]

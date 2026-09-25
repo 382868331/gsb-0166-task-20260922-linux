@@ -1,4 +1,4 @@
-"""五级流水线周期内核（IF/ID/EX/MEM/WB），带精确异常语义。
+"""五级流水线周期内核（IF/ID/EX/MEM/WB），带精确异常与显式外部中断。
 
 时序约定（每个周期）：
   1. WB  退休/提交：寄存器写、STORE 内存写、HALT、非法访存报告都在这里；
@@ -15,6 +15,16 @@
 * 前递：EX 取操作数时 MEM 锁存器（最新）优先，其次 WB 锁存器，
   再次 ID 级捕获的寄存器值；
 * BEQ 在 EX 决策，命中时把当周期 ID、IF 中的两条年轻指令标记为冲刷。
+
+外部中断（固定向量 VECTOR_PC，不改指令编码）：
+* 每周期先把中断控制器当拍脉冲并入一位 pending（不计数）；
+* WB 一条指令**正常退休后**的边界才考虑接纳：HALT 退休后不接纳；
+  同拍 WB 报告同步访存异常时异常优先，中断保持 pending；
+* 接纳时保存"下一条尚未退休指令"的 PC（取 MEM/EX/ID/IF 中最老的
+  有效锁存器，否则取下一取指 PC），冲刷全部年轻指令，PC 改向
+  VECTOR_PC，并置屏蔽位；屏蔽期间脉冲只并入 pending；
+* IRET 退休后恢复保存的 PC、冲刷年轻指令并解除屏蔽；IRET 自己的
+  退休边界不接纳中断（最早在恢复后的第一条指令退休边界）。
 """
 
 from __future__ import annotations
@@ -22,12 +32,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from .interrupt import InterruptAccept, InterruptController
 from .isa import (
     MASK32,
     MAX_CYCLES,
+    VECTOR_PC,
     CycleLimitError,
     Fault,
     Instruction,
+    InterruptStateError,
     Op,
     validate_program,
 )
@@ -44,7 +57,9 @@ class Slot:
     index: 指令下标（气泡且无受害者时为 None）。
     bubble: True 表示该级本周期不执行有效指令。
     reason: None 正常；"stall" load-use 气泡；"flush" 分支冲刷；
-            "hold" load-use 时被冻结的 IF/ID；"drain" HALT 后排空/启动填充。
+            "hold" load-use 时被冻结的 IF/ID；"drain" HALT 后排空/启动填充；
+            "intr" 中断接纳冲刷的年轻指令（及随后传播的气泡）；
+            "iret" IRET 冲刷的年轻指令（及随后传播的气泡）。
     """
 
     stage: str
@@ -74,6 +89,11 @@ class RetireRecord:
     * rd/value 非 None   —— 提交了一个寄存器写（r0 的写被架构丢弃，不记录）；
     * addr/mem_value     —— 提交了一个 32 位 STORE；
     * HALT/BEQ/普通算术无写时只有 pc/op。
+
+    中断控制字段（仅在中断接纳边界的那条退休记录上非 None）：
+    * event == "INTR"    —— 该指令正常退休后接纳了外部中断：
+                            saved_pc 为保存的"下一条尚未退休指令"下标；
+    * event == "IRET"    —— 该记录是 IRET 退休：saved_pc 为其恢复的 PC。
     """
 
     cycle: int
@@ -84,6 +104,8 @@ class RetireRecord:
     value: Optional[int] = None
     addr: Optional[int] = None
     mem_value: Optional[int] = None
+    event: Optional[str] = None
+    saved_pc: Optional[int] = None
 
     @property
     def committed(self) -> bool:
@@ -102,6 +124,9 @@ class RunResult:
     fault: Optional[Fault]
     fault_pc: Optional[int]
     fault_cycle: Optional[int]
+    interrupts: tuple[InterruptAccept, ...] = ()
+    interrupts_pending: bool = False
+    masked: bool = False
 
     @property
     def cycles_used(self) -> int:
@@ -140,15 +165,26 @@ def run(
     instructions: list[Instruction] | tuple[Instruction, ...],
     memory: bytes | bytearray,
     initial_regs: Optional[list[int]] = None,
+    interrupts: Optional[InterruptController] = None,
 ) -> RunResult:
     """跑五级流水线直到 HALT 退休、非法访存报告或周期预算耗尽。
 
     参数静态校验全部在第一条指令执行前完成，失败不会产生任何部分结果。
 
+    ``interrupts`` 为可选的离线 :class:`~tinycpu.interrupt.InterruptController`：
+    脉冲按拍号登记，在每条指令正常退休后的边界采样接纳（详见模块文档）。
+    ``None`` 时行为与无中断版本完全一致。
+
     Raises:
         TypeError/ValueError/ProgramError: 输入不合法。
+        InterruptStateError: IRET 在没有活跃中断（未屏蔽）时退休。
         CycleLimitError: 跑满 ``MAX_CYCLES`` 仍未结束（预算耗尽，区别于故障）。
     """
+    if interrupts is not None and not isinstance(interrupts, InterruptController):
+        raise TypeError(
+            "interrupts 必须是 tinycpu.InterruptController 或 None，"
+            f"收到 {type(interrupts).__name__}"
+        )
     prog, mem, regs = validate_program(instructions, memory, initial_regs)
     n = len(prog)
 
@@ -166,6 +202,13 @@ def run(
     fault_pc: Optional[int] = None
     fault_cycle: Optional[int] = None
 
+    # 中断状态：pending 一位（脉冲合并，不计数）；masked 屏蔽嵌套；
+    # saved_pc 保存接纳时"下一条尚未退休指令"下标。
+    pending = False
+    masked = False
+    saved_pc: Optional[int] = None
+    interrupt_log: list[InterruptAccept] = []
+
     for cycle in range(1, MAX_CYCLES + 1):
         # 本周期控制信号
         wb_fault_this_cycle = False
@@ -173,6 +216,10 @@ def run(
         flush = False
         flush_victim_id: Optional[int] = None
         flush_victim_if: Optional[int] = None
+
+        # 当拍脉冲先并入 pending（屏蔽中也只并入这一位，不计数）。
+        if interrupts is not None and interrupts.has_pulse(cycle):
+            pending = True
 
         # ---- 记录本周期各级"占据者"（控制信号可能改写 ID/IF 的标记） ----
         slot_if = Slot("IF", pc if pc < n else None, pc >= n,
@@ -193,6 +240,11 @@ def run(
             "WB", mem_wb.pc if mem_wb.valid else None, bubble=not mem_wb.valid,
             reason=None if mem_wb.valid else mem_wb.bubble_reason or "drain",
         )
+
+        # 本周期 WB 的正常退休是否可作为中断接纳边界由下面的 WB 逻辑内联
+        # 判定（fault/HALT/IRET 各自排除），无需额外标志。
+        intr_accept = False
+        iret_ret = False
 
         # ==============================================================
         # 1) WB：退休。所有架构提交只发生在这里。
@@ -227,6 +279,39 @@ def run(
                     rec_kwargs.update(addr=a, mem_value=mem_wb.store_data)
                 elif w.op == Op.HALT:
                     halted = True
+                elif w.op == Op.IRET:
+                    # 只能在中断处理（屏蔽）中退休；否则没有保存 PC 可恢复。
+                    if not masked or saved_pc is None:
+                        raise InterruptStateError(
+                            f"IRET 在周期 {cycle} 退休时没有活跃中断"
+                            "（未屏蔽、无保存 PC）"
+                        )
+                    iret_ret = True
+
+                # ---- 中断接纳：本指令正常退休后的边界 ----
+                # 优先级：WB 同步异常（上面分支）> 中断。
+                # HALT 退休后不接纳；IRET 自己的退休边界不接纳
+                # （最早在恢复后的第一条指令退休边界）。
+                if (
+                    pending
+                    and not masked
+                    and w.op not in (Op.HALT, Op.IRET)
+                ):
+                    intr_accept = True
+                    saved = _oldest_unretired_pc(ex_mem, id_ex, if_id, pc)
+                    saved_pc = saved
+                    pending = False
+                    masked = True
+                    interrupt_log.append(
+                        InterruptAccept(
+                            cycle=cycle, saved_pc=saved, retired_pc=mem_wb.pc
+                        )
+                    )
+                    rec_kwargs.update(event="INTR", saved_pc=saved)
+                elif iret_ret:
+                    # 恢复保存 PC 后才解除屏蔽（在本周期末下沉时生效）。
+                    rec_kwargs.update(event="IRET", saved_pc=saved_pc)
+
                 trace.append(RetireRecord(**rec_kwargs))
 
         # ==============================================================
@@ -234,7 +319,12 @@ def run(
         #    （wb_fault 时 MEM 的年轻指令即使读了也不会被前递到任何会提交
         #      的指令，锁存器整体丢弃即可。）
         # ==============================================================
-        if ex_mem.valid and not wb_fault_this_cycle:
+        if (
+            ex_mem.valid
+            and not wb_fault_this_cycle
+            and not intr_accept
+            and not iret_ret
+        ):
             m = ex_mem.insn
             assert m is not None
             if m.op == Op.LOAD and not ex_mem.bad_addr:
@@ -243,8 +333,14 @@ def run(
 
         # ==============================================================
         # 3) EX：ALU / 地址 / 分支决策（含前递）。
+        #    中断接纳/IRET 冲刷时年轻指令的 EX 结果一律作废。
         # ==============================================================
-        if id_ex.valid and not wb_fault_this_cycle:
+        if (
+            id_ex.valid
+            and not wb_fault_this_cycle
+            and not intr_accept
+            and not iret_ret
+        ):
             x = id_ex.insn
             assert x is not None
 
@@ -270,16 +366,18 @@ def run(
                     flush_victim_if = pc if pc < n else None
                     pc = id_ex.pc + x.imm  # 已静态校验落在 [0, n)
                     slot_ex = Slot("EX", id_ex.pc, bubble=False, reason="take")
-            # HALT：EX 无动作
+            # HALT/IRET：EX 无动作
 
         # ==============================================================
-        # 4) ID：load-use 冒险检测（WB 已故障则整管线下沉丢弃）。
+        # 4) ID：load-use 冒险检测（WB 已故障/中断冲刷则整体丢弃）。
         # ==============================================================
         if (
             if_id.valid
             and id_ex.valid
             and not wb_fault_this_cycle
             and not flush
+            and not intr_accept
+            and not iret_ret
         ):
             d = if_id.insn
             e = id_ex.insn
@@ -288,7 +386,7 @@ def run(
                 stall = True
 
         # ==============================================================
-        # 5) 流水槽标记（冲刷/停顿可视化）。
+        # 5) 流水槽标记（冲刷/停顿/中断可视化）。
         # ==============================================================
         if wb_fault_this_cycle:
             # 年轻各级标记为丢弃。
@@ -300,6 +398,26 @@ def run(
                 slot_id = Slot("ID", if_id.pc, bubble=True, reason="fault")
             if pc < n:
                 slot_if = Slot("IF", pc, bubble=True, reason="fault")
+        elif intr_accept:
+            # 中断接纳：老指令已在 WB 正常退休；MEM/EX/ID/IF 全部年轻，
+            # 本周期末冲刷，不允许任何年轻 STORE 提交。
+            if ex_mem.valid:
+                slot_me = Slot("MEM", ex_mem.pc, bubble=True, reason="intr")
+            if id_ex.valid:
+                slot_ex = Slot("EX", id_ex.pc, bubble=True, reason="intr")
+            if if_id.valid:
+                slot_id = Slot("ID", if_id.pc, bubble=True, reason="intr")
+            if pc < n:
+                slot_if = Slot("IF", pc, bubble=True, reason="intr")
+        elif iret_ret:
+            if ex_mem.valid:
+                slot_me = Slot("MEM", ex_mem.pc, bubble=True, reason="iret")
+            if id_ex.valid:
+                slot_ex = Slot("EX", id_ex.pc, bubble=True, reason="iret")
+            if if_id.valid:
+                slot_id = Slot("ID", if_id.pc, bubble=True, reason="iret")
+            if pc < n:
+                slot_if = Slot("IF", pc, bubble=True, reason="iret")
         elif flush:
             if flush_victim_id is not None:
                 slot_id = Slot("ID", flush_victim_id, bubble=True, reason="flush")
@@ -316,14 +434,36 @@ def run(
         )
 
         # 异常：本周期结束即停（WB 老指令已提交，年轻指令全部未落架构状态）。
+        # 同一边界若还有中断脉冲：异常优先，中断保持 pending（结果中可见）。
         if wb_fault_this_cycle:
             break
         if halted:
+            # HALT 退休后不再接纳中断（接纳条件已排除 HALT）。
             break
 
         # ==============================================================
         # 锁存器下沉（组合逻辑结果在本周期末打入）。
         # ==============================================================
+        if intr_accept:
+            # 冲刷全部年轻指令；下周期从固定向量取指，屏蔽已置位。
+            mem_wb = _Latch()
+            ex_mem = _Latch()
+            id_ex = _Latch(bubble_reason="intr")
+            if_id = _Latch()
+            pc = VECTOR_PC
+            continue
+        if iret_ret:
+            # 恢复保存 PC，冲刷年轻指令，此后才解除屏蔽。
+            assert saved_pc is not None
+            mem_wb = _Latch()
+            ex_mem = _Latch()
+            id_ex = _Latch(bubble_reason="iret")
+            if_id = _Latch()
+            pc = saved_pc
+            masked = False
+            saved_pc = None
+            continue
+
         # WB <- MEM，MEM <- EX（整条锁存器复制）。
         mem_wb = ex_mem
         ex_mem = id_ex
@@ -369,6 +509,9 @@ def run(
         fault=fault,
         fault_pc=fault_pc,
         fault_cycle=fault_cycle,
+        interrupts=tuple(interrupt_log),
+        interrupts_pending=pending,
+        masked=masked,
     )
 
 
@@ -379,6 +522,25 @@ def run(
 
 def _addr_ok(addr: int, mem_len: int) -> bool:
     return addr % 4 == 0 and 0 <= addr <= mem_len - 4
+
+
+def _oldest_unretired_pc(
+    ex_mem: _Latch,
+    id_ex: _Latch,
+    if_id: _Latch,
+    next_fetch_pc: int,
+) -> int:
+    """中断接纳时，求"下一条尚未退休指令"的下标。
+
+    WB 指令本周期已退休。按 MEM -> EX -> ID -> IF 的年老顺序取第一个
+    有效锁存器；都空（例如接纳发生在排空段）则取下一取指 PC。
+    注意被冲刷的受害者锁存器已经是无效气泡（valid=False），因此这里
+    天然跳过它们：分支冲刷边界保存的就是分支目标而非已冲刷指令。
+    """
+    for latch in (ex_mem, id_ex, if_id):
+        if latch.valid:
+            return latch.pc
+    return next_fetch_pc
 
 
 def _uses(d: Instruction, reg: int) -> bool:
