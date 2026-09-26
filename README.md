@@ -5,6 +5,10 @@
 （非法访存延迟到 WB 才报告，年轻指令不得提交，老指令正常退休）。
 另附一个**独立**的无流水顺序参考解释器，用于交叉验证。
 
+增量能力：可选的**分支预测**——直接索引的两位饱和计数器预测表，BEQ 在
+取指时选择预测 PC，EX 发现错判即冲刷年轻指令，训练只发生在分支提交时。
+不启用预测时行为与基线完全一致。
+
 仅使用 Python 3.14.7 标准库，零第三方依赖，完全离线运行。
 
 ## 运行环境与命令
@@ -13,17 +17,33 @@
 - 依赖：无（`requirements.txt` 仅为占位注释，不需要 `pip install` 任何东西）
 - 操作系统：Linux 原生验证，纯标准库代码本身跨平台
 
+### 隔离 venv 准备（可选但推荐）
+
+本模块只用标准库，venv 里不需要安装任何依赖：
+
+```bash
+python3 -m venv .venv          # 创建隔离环境
+. .venv/bin/activate           # 或直接使用 .venv/bin/python
+# 无需 pip install：requirements.txt 仅为占位注释
+```
+
+### 测试与演示
+
 在本目录（含 `tinycpu/`、`tests/`、`demo.py` 的目录）执行：
 
 ```bash
-# 必要测试（39 个用例，含 700 个确定性随机程序的差分测试）
+# 必要测试（52 个用例，含 700+260 个确定性随机/循环程序的差分对账）
 python -m unittest discover -s tests -v
 
-# 固定输入演示：正常结果（含气泡/冲刷）+ 实际触发的异常边界 + 输入拒绝
+# 基线演示：正常结果（含气泡/冲刷）+ 实际触发的异常边界 + 输入拒绝
 python demo.py
+
+# 分支预测演示：循环统计、别名碰撞、错误路径副作用、训练时机
+python demo_iteration.py
 ```
 
-`demo.py` 为真实当场计算，无 sleep、无预录结果，通常 0.1 秒内完成。
+`demo.py` 与 `demo_iteration.py` 均为真实当场计算，无 sleep、无预录结果，
+各自通常 0.1 秒内完成（远低于 90 秒上限），不需要账号、密钥或网络。
 
 ## ISA 子集
 
@@ -77,6 +97,32 @@ Instruction.halt()
 `"stall"`（load-use 气泡，沿 EX→MEM→WB 传播）/`"hold"`（停顿冻结 IF/ID）/
 `"flush"`（分支冲刷）/`"take"`（分支命中的 EX 槽）/`"fault"`（故障丢弃/报告）。
 
+### 分支预测（增量）
+
+```python
+from tinycpu import BranchPredictor, Instruction, memory_from_words
+from tinycpu.pipeline import run
+
+pred = BranchPredictor(entries=8, initial=1)   # 容量与初值由调用方给定
+result = run(prog, memory_from_words([0] * 4), predictor=pred)
+print(result.prediction)   # PredictionStats(predictions=..., mispredictions=..., flushed=...)
+```
+
+- `BranchPredictor(entries, initial)`：`entries >= 1` 个两位饱和计数器
+  （0..3，>=2 预测命中），`initial` 为每项初值（0..3）。按 `pc % entries`
+  直接索引，**允许别名碰撞**，不做标记匹配；`predict(pc)`/`update(pc, taken)`
+  /`counter(pc)`/`counters` 可外部查询。
+- `run(..., predictor=...)`：BEQ 在**取指**时查询预测器并选择预测 PC；
+  EX 解析发现方向/目标不符即冲刷 ID/IF 年轻指令并改向；**训练只在分支于
+  WB 提交时发生**——被冲刷的分支（含错误路径取到的 BEQ、被老指令故障
+  丢弃的已解析分支）不会污染计数器。已解析未提交的方向随锁存器
+  （`br_taken`）保留到 WB，不挤在取指阶段。
+- 错误路径上的 STORE、HALT、非法访存与基线一样不会成为架构结果
+  （提交点唯一在 WB）；预测只改变取指顺序，不改变提交语义。
+- `RunResult.prediction`：启用预测时为 `PredictionStats`
+  （`predictions` 取指预测次数、`mispredictions` 错判次数、`flushed`
+  被冲刷的年轻指令条数）；未启用时为 `None`，行为与基线完全一致。
+
 ### `tinycpu.run_sequential(instructions, memory, initial_regs=None) -> SeqResult`
 
 独立顺序参考解释器（`tinycpu/sequential.py`）。**不导入、不调用流水线核心**，
@@ -123,6 +169,9 @@ Instruction.halt()
 6. LOAD 读内存在 MEM 级发生；地址非法时不触碰内存（避免越界切片）。
 7. 顺序参考是独立实现，期望值不依赖被测核心；"两轮流水线结果相同"式的
    往返一致只在测试中作为补充性结构断言。
+8. 分支预测是纯性能特性：预测器只影响取指 PC 的选择，所有架构状态变更
+   仍只在 WB 提交点发生，因此带预测与不带预测、以及与顺序参考的退休
+   轨迹逐条一致（测试中对 700+260 个确定性程序做了差分对账）。
 
 ## 浮点 / 数值误差口径
 
@@ -136,12 +185,15 @@ Instruction.halt()
 ```
 tinycpu/__init__.py     公开接口导出
 tinycpu/isa.py          指令/常量/校验/内存辅助/错误类型
-tinycpu/pipeline.py     五级流水线周期内核（被测核心）
+tinycpu/pipeline.py     五级流水线周期内核（被测核心，含可选预测接入）
+tinycpu/predict.py      两位饱和计数器分支预测器与预测统计
 tinycpu/sequential.py   独立顺序参考解释器（不依赖 pipeline）
 tests/test_inputs.py    输入校验与错误语义
 tests/test_pipeline.py  流水线时序：停顿/前递/冲刷/精确异常/上限
 tests/test_equivalence.py  与顺序参考的差分测试（700 个确定性随机程序）
-demo.py                 固定输入演示
+tests/test_predict.py   分支预测：统计/别名/错误路径副作用/训练时机/差分对账
+demo.py                 基线固定输入演示
+demo_iteration.py       分支预测增量演示（真实离线计算，<90 秒）
 ```
 
 ## 已知限制
@@ -154,3 +206,7 @@ demo.py                 固定输入演示
   `CycleLimitError`，这是预算限制而非程序故障。
 - 内存上限 1 MiB 为本实现的固定边界（题目未规定数据内存大小）。
 - 周期内核为教学清晰度优先的直接锁存器模拟，未做性能优化。
+- 预测器只有方向预测（两位饱和计数器），无目标缓冲/返回栈；BEQ 目标
+  由静态立即数直接算出。无缓存模型，也不是完整乱序 CPU。
+- 预测统计中 `predictions` 在取指时计数，包含错误路径上未来得及解析
+  就被冲刷的取指（预测确实发生并影响了取指）。

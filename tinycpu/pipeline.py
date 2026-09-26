@@ -31,6 +31,7 @@ from .isa import (
     Op,
     validate_program,
 )
+from .predict import BranchPredictor, PredictionStats
 
 # ---------------------------------------------------------------------------
 # 对外数据结构
@@ -102,6 +103,7 @@ class RunResult:
     fault: Optional[Fault]
     fault_pc: Optional[int]
     fault_cycle: Optional[int]
+    prediction: Optional[PredictionStats] = None
 
     @property
     def cycles_used(self) -> int:
@@ -127,6 +129,9 @@ class _Latch:
     addr: int = 0            # LOAD/STORE 有效字节地址
     bad_addr: bool = False   # EX 已判定非法，但延迟到 WB 报告
     store_data: int = 0      # STORE 要写的 32 位值
+    # 分支预测状态（仅 BEQ 使用）
+    pred_next_pc: int = -1   # 取指时预测的下一 PC
+    br_taken: bool = False   # EX 已解析的真实方向，随锁存器带到 WB 供训练
     # MEM 产物
     load_data: int = 0
 
@@ -140,15 +145,24 @@ def run(
     instructions: list[Instruction] | tuple[Instruction, ...],
     memory: bytes | bytearray,
     initial_regs: Optional[list[int]] = None,
+    predictor: Optional[BranchPredictor] = None,
 ) -> RunResult:
     """跑五级流水线直到 HALT 退休、非法访存报告或周期预算耗尽。
 
     参数静态校验全部在第一条指令执行前完成，失败不会产生任何部分结果。
 
+    predictor 为 None 时行为与基线完全一致（等价于永远预测不命中）；
+    传入 BranchPredictor 后，BEQ 在取指时按预测方向选择 PC，EX 解析
+    发现错判即冲刷年轻指令，训练只在分支于 WB 提交时发生。
+
     Raises:
         TypeError/ValueError/ProgramError: 输入不合法。
         CycleLimitError: 跑满 ``MAX_CYCLES`` 仍未结束（预算耗尽，区别于故障）。
     """
+    if predictor is not None and not isinstance(predictor, BranchPredictor):
+        raise TypeError(
+            f"predictor 必须是 BranchPredictor 或 None，收到 {type(predictor).__name__}"
+        )
     prog, mem, regs = validate_program(instructions, memory, initial_regs)
     n = len(prog)
 
@@ -158,6 +172,9 @@ def run(
     mem_wb = _Latch()
 
     pc = 0
+    predictions = 0
+    mispredictions = 0
+    flushed = 0
     trace: list[RetireRecord] = []
     cycle_log: list[CycleSlots] = []
 
@@ -225,6 +242,11 @@ def run(
                     a = mem_wb.addr
                     mem[a : a + 4] = mem_wb.store_data.to_bytes(4, "little")
                     rec_kwargs.update(addr=a, mem_value=mem_wb.store_data)
+                elif w.op == Op.BEQ:
+                    # 训练只发生在提交点：被冲刷的分支永远到不了 WB，
+                    # 因此错误路径的分支不会污染计数器。
+                    if predictor is not None:
+                        predictor.update(mem_wb.pc, mem_wb.br_taken)
                 elif w.op == Op.HALT:
                     halted = True
                 trace.append(RetireRecord(**rec_kwargs))
@@ -264,11 +286,20 @@ def run(
                 if x.op == Op.STORE:
                     id_ex.store_data = v2
             elif x.op == Op.BEQ:
-                if v1 == v2:
+                taken = v1 == v2
+                # 已解析但尚未提交的状态保留在锁存器里，随流水线带到 WB。
+                id_ex.br_taken = taken
+                actual_next = id_ex.pc + x.imm if taken else id_ex.pc + 1
+                # 未启用预测时等价于"永远预测不命中"，与基线行为一致。
+                predicted_next = (
+                    id_ex.pred_next_pc if predictor is not None else id_ex.pc + 1
+                )
+                if actual_next != predicted_next:
+                    mispredictions += 1
                     flush = True
                     flush_victim_id = if_id.pc if if_id.valid else None
                     flush_victim_if = pc if pc < n else None
-                    pc = id_ex.pc + x.imm  # 已静态校验落在 [0, n)
+                    pc = actual_next  # 目标已静态校验落在 [0, n)
                     slot_ex = Slot("EX", id_ex.pc, bubble=False, reason="take")
             # HALT：EX 无动作
 
@@ -301,6 +332,7 @@ def run(
             if pc < n:
                 slot_if = Slot("IF", pc, bubble=True, reason="fault")
         elif flush:
+            flushed += (flush_victim_id is not None) + (flush_victim_if is not None)
             if flush_victim_id is not None:
                 slot_id = Slot("ID", flush_victim_id, bubble=True, reason="flush")
             if flush_victim_if is not None:
@@ -339,20 +371,25 @@ def run(
         else:
             id_ex = _new_id_ex(if_id, regs)
 
-        # ID <- IF（停顿保持；冲刷插普通气泡；否则取当前 PC 指令）
+        # ID <- IF 与 PC 更新合并：停顿全部冻结；冲刷插普通气泡（PC 已在
+        # EX 改写）；否则取当前 PC 指令——BEQ 在取指时查询预测器并直接
+        # 选择预测 PC，其余顺序 +1。
         if stall:
-            pass  # if_id 保持
+            pass  # if_id 与 pc 保持
         elif flush:
             if_id = _Latch()
-        else:
-            if pc < n:
-                if_id = _Latch(valid=True, pc=pc, insn=prog[pc])
+        elif pc < n:
+            fetched = prog[pc]
+            if_id = _Latch(valid=True, pc=pc, insn=fetched)
+            if predictor is not None and fetched.op == Op.BEQ:
+                predictions += 1
+                pc += fetched.imm if predictor.predict(pc) else 1
+                # 预测的下一 PC 记入锁存器，供 EX 解析时比对。
+                if_id.pred_next_pc = pc
             else:
-                if_id = _Latch()
-
-        # PC（停顿冻结；冲刷已在 EX 改写；否则 +1）
-        if not stall and not flush:
-            pc += 1
+                pc += 1
+        else:
+            if_id = _Latch()
 
     else:
         # for/else：预算耗尽，且最后一个周期也没有 halt/fault。
@@ -369,6 +406,11 @@ def run(
         fault=fault,
         fault_pc=fault_pc,
         fault_cycle=fault_cycle,
+        prediction=(
+            PredictionStats(predictions, mispredictions, flushed)
+            if predictor is not None
+            else None
+        ),
     )
 
 
@@ -423,4 +465,5 @@ def _new_id_ex(if_id: _Latch, regs: list[int]) -> _Latch:
         insn=d,
         rs1_val=regs[d.rs1],
         rs2_val=regs[d.rs2],
+        pred_next_pc=if_id.pred_next_pc,
     )
