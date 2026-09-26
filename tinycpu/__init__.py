@@ -32,6 +32,7 @@ from .pipeline import (
     run,
 )
 from .sequential import SeqTraceEntry, run_sequential
+from .mmio import MMIO_READ, MMIO_WRITE, MMIOBus, MMIOEmptyError
 
 __all__ = [
     "ADD",
@@ -60,4 +61,8 @@ __all__ = [
     "run",
     "SeqTraceEntry",
     "run_sequential",
+    "MMIO_READ",
+    "MMIO_WRITE",
+    "MMIOBus",
+    "MMIOEmptyError",
 ]

@@ -31,6 +31,7 @@ from .isa import (
     Op,
     validate_program,
 )
+from .mmio import MMIO_READ, MMIO_WRITE, MMIOBus, MMIOEmptyError
 
 # ---------------------------------------------------------------------------
 # 对外数据结构
@@ -84,6 +85,7 @@ class RetireRecord:
     value: Optional[int] = None
     addr: Optional[int] = None
     mem_value: Optional[int] = None
+    mmio: Optional[str] = None  # "read"/"write"：本条在提交点访问了设备
 
     @property
     def committed(self) -> bool:
@@ -126,6 +128,7 @@ class _Latch:
     result: int = 0          # ALU/ADDI 结果
     addr: int = 0            # LOAD/STORE 有效字节地址
     bad_addr: bool = False   # EX 已判定非法，但延迟到 WB 报告
+    is_mmio: bool = False    # 有效地址命中 MMIO 范围（设备访问延迟到 WB）
     store_data: int = 0      # STORE 要写的 32 位值
     # MEM 产物
     load_data: int = 0
@@ -140,8 +143,14 @@ def run(
     instructions: list[Instruction] | tuple[Instruction, ...],
     memory: bytes | bytearray,
     initial_regs: Optional[list[int]] = None,
+    mmio: Optional[MMIOBus] = None,
 ) -> RunResult:
-    """跑五级流水线直到 HALT 退休、非法访存报告或周期预算耗尽。
+    """跑五级流水线直到 HALT 退休、异常报告或周期预算耗尽。
+
+    ``mmio`` 为 None 时行为与纯内存机器完全一致。给定 MMIOBus 时，命中其
+    显式地址范围的 LOAD/STORE 是设备访问：不在 MEM 级触碰，只在 WB 提交点
+    执行恰好一次（读弹队首 / 写追加记录），因此被分支冲刷或异常丢弃的
+    年轻指令不会碰设备。设备空读在 WB 报 ``Fault.MMIO_EMPTY``。
 
     参数静态校验全部在第一条指令执行前完成，失败不会产生任何部分结果。
 
@@ -149,6 +158,10 @@ def run(
         TypeError/ValueError/ProgramError: 输入不合法。
         CycleLimitError: 跑满 ``MAX_CYCLES`` 仍未结束（预算耗尽，区别于故障）。
     """
+    if mmio is not None and not isinstance(mmio, MMIOBus):
+        raise TypeError(
+            f"mmio 必须是 tinycpu.MMIOBus 或 None，收到 {type(mmio).__name__}"
+        )
     prog, mem, regs = validate_program(instructions, memory, initial_regs)
     n = len(prog)
 
@@ -200,15 +213,28 @@ def run(
         if mem_wb.valid:
             w = mem_wb.insn
             assert w is not None
-            if w.op in (Op.LOAD, Op.STORE) and mem_wb.bad_addr:
+            # MMIO 设备读在提交点执行：空队列即在本级报 MMIO_EMPTY，
+            # 与 bad_addr 一样年轻指令全部不提交。
+            mmio_empty = False
+            if (
+                w.op == Op.LOAD
+                and mem_wb.is_mmio
+                and not mem_wb.bad_addr
+                and mmio is not None
+            ):
+                try:
+                    mem_wb.load_data = mmio.read()
+                except MMIOEmptyError:
+                    mmio_empty = True
+            if (w.op in (Op.LOAD, Op.STORE) and mem_wb.bad_addr) or mmio_empty:
                 # 非法访存到 WB 才报告：本指令不提交，
                 # 同周期 MEM/EX/ID/IF 全部更年轻，一律不提交。
                 wb_fault_this_cycle = True
-                fault = Fault.ADDR
+                fault = Fault.MMIO_EMPTY if mmio_empty else Fault.ADDR
                 fault_pc = mem_wb.pc
                 fault_cycle = cycle
                 trace.append(
-                    RetireRecord(cycle=cycle, pc=mem_wb.pc, op=w.op, fault=Fault.ADDR)
+                    RetireRecord(cycle=cycle, pc=mem_wb.pc, op=w.op, fault=fault)
                 )
                 slot_wb = Slot("WB", mem_wb.pc, bubble=False, reason="fault")
             else:
@@ -218,13 +244,23 @@ def run(
                         regs[w.rd] = mem_wb.result
                         rec_kwargs.update(rd=w.rd, value=mem_wb.result)
                 elif w.op == Op.LOAD:
+                    if mem_wb.is_mmio:
+                        rec_kwargs["mmio"] = MMIO_READ
                     if w.rd != 0:
                         regs[w.rd] = mem_wb.load_data
                         rec_kwargs.update(rd=w.rd, value=mem_wb.load_data)
                 elif w.op == Op.STORE:
                     a = mem_wb.addr
-                    mem[a : a + 4] = mem_wb.store_data.to_bytes(4, "little")
-                    rec_kwargs.update(addr=a, mem_value=mem_wb.store_data)
+                    if mem_wb.is_mmio:
+                        # 设备写在提交点恰好执行一次，普通内存不受影响。
+                        assert mmio is not None
+                        mmio.write(mem_wb.store_data)
+                        rec_kwargs.update(
+                            addr=a, mem_value=mem_wb.store_data, mmio=MMIO_WRITE
+                        )
+                    else:
+                        mem[a : a + 4] = mem_wb.store_data.to_bytes(4, "little")
+                        rec_kwargs.update(addr=a, mem_value=mem_wb.store_data)
                 elif w.op == Op.HALT:
                     halted = True
                 trace.append(RetireRecord(**rec_kwargs))
@@ -237,7 +273,7 @@ def run(
         if ex_mem.valid and not wb_fault_this_cycle:
             m = ex_mem.insn
             assert m is not None
-            if m.op == Op.LOAD and not ex_mem.bad_addr:
+            if m.op == Op.LOAD and not ex_mem.bad_addr and not ex_mem.is_mmio:
                 a = ex_mem.addr
                 ex_mem.load_data = int.from_bytes(mem[a : a + 4], "little")
 
@@ -260,7 +296,16 @@ def run(
             elif x.op in (Op.LOAD, Op.STORE):
                 addr = (v1 + x.imm) & MASK32
                 id_ex.addr = addr
-                id_ex.bad_addr = not _addr_ok(addr, len(mem))
+                if mmio is not None and mmio.contains(addr):
+                    # 命中显式 MMIO 范围：方向必须匹配（LOAD->读寄存器，
+                    # STORE->写寄存器），否则按地址错处理；设备本身在 WB 才动。
+                    id_ex.is_mmio = True
+                    id_ex.bad_addr = (
+                        (x.op == Op.LOAD and not mmio.is_read_reg(addr))
+                        or (x.op == Op.STORE and not mmio.is_write_reg(addr))
+                    )
+                else:
+                    id_ex.bad_addr = not _addr_ok(addr, len(mem))
                 if x.op == Op.STORE:
                     id_ex.store_data = v2
             elif x.op == Op.BEQ:

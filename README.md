@@ -5,6 +5,11 @@
 （非法访存延迟到 WB 才报告，年轻指令不得提交，老指令正常退休）。
 另附一个**独立**的无流水顺序参考解释器，用于交叉验证。
 
+增量能力：**显式地址范围的 MMIO 设备**。设备用本地小状态机模拟（不连接
+任何外设）——读寄存器每读一次弹出队首，写寄存器每写一次追加记录。
+设备访问只在提交点（WB 级）发生，对每条退休指令恰好一次；被分支冲刷
+或异常丢弃的年轻指令不会触碰设备。
+
 仅使用 Python 3.14.7 标准库，零第三方依赖，完全离线运行。
 
 ## 运行环境与命令
@@ -16,14 +21,22 @@
 在本目录（含 `tinycpu/`、`tests/`、`demo.py` 的目录）执行：
 
 ```bash
-# 必要测试（39 个用例，含 700 个确定性随机程序的差分测试）
+# 可选：隔离 venv（非必需——零第三方依赖，系统 Python 3.14.7 即可直接跑）
+python3 -m venv .venv
+. .venv/bin/activate        # 之后文中的 python 即 .venv 内的解释器
+
+# 必要测试（54 个用例，含 700+120 个确定性随机程序的差分测试）
 python -m unittest discover -s tests -v
 
 # 固定输入演示：正常结果（含气泡/冲刷）+ 实际触发的异常边界 + 输入拒绝
 python demo.py
+
+# MMIO 增量演示：提交点恰好一次的设备访问、分支冲刷、设备空读异常
+python demo_iteration.py
 ```
 
-`demo.py` 为真实当场计算，无 sleep、无预录结果，通常 0.1 秒内完成。
+`demo.py` 与 `demo_iteration.py` 均为真实当场离线计算，无账号、无密钥、
+无 sleep、无预录结果，各自通常 0.1 秒内完成（远低于 90 秒限制）。
 
 ## ISA 子集
 
@@ -73,6 +86,8 @@ Instruction.halt()
 | `halted` | 是否由 HALT 正常结束 |
 | `fault` / `fault_pc` / `fault_cycle` | 异常类型（仅 `Fault.ADDR`）、指令下标、报告周期 |
 
+异常类型：`Fault.ADDR`（地址错）、`Fault.MMIO_EMPTY`（设备空读）。
+
 `Slot(index, bubble, reason)`：`reason` 取 `None`/`"drain"`（启动排空）/
 `"stall"`（load-use 气泡，沿 EX→MEM→WB 传播）/`"hold"`（停顿冻结 IF/ID）/
 `"flush"`（分支冲刷）/`"take"`（分支命中的 EX 槽）/`"fault"`（故障丢弃/报告）。
@@ -82,6 +97,31 @@ Instruction.halt()
 独立顺序参考解释器（`tinycpu/sequential.py`）。**不导入、不调用流水线核心**，
 语义独立实现，共享的只有 `isa.py` 里的指令格式与静态校验。用于得到
 独立期望值：最终寄存器、异常前内存、逐条架构效果。
+
+### MMIO 设备（增量）：`tinycpu.MMIOBus`
+
+```python
+from tinycpu import MMIOBus
+bus = MMIOBus(read_addr=0x8000, write_addr=0x8004, read_values=[0xABCD, 7])
+res = run(prog, mem, mmio=bus)          # run_sequential 同样接受 mmio=
+q, read_log, write_log = bus.snapshot()  # 剩余读队列 / 读日志 / 写记录
+```
+
+- **显式地址范围**：`read_addr` 与 `write_addr` 为两个 4 对齐、互不相同的
+  32 位字节地址，`bus.address_range` 给出覆盖两者的 `[lo, hi)` 区间。
+  命中这两个地址的 LOAD/STORE 是设备访问；不传 `mmio` 时行为与基线完全
+  一致（这些地址只是普通越界地址，报 `Fault.ADDR`）。
+- **设备语义**：LOAD 命中 `read_addr` 在提交点弹出读队列队首并写回目标
+  寄存器（不预测、不事后校正）；STORE 命中 `write_addr` 在提交点把值
+  追加到写记录。方向不匹配（LOAD 写寄存器 / STORE 读寄存器）按
+  `Fault.ADDR` 处理；空队列读按 `Fault.MMIO_EMPTY` 处理。
+- **只在提交点执行**：设备读/写与普通寄存器写回、内存 STORE 一样只在
+  WB 级发生，因此与此前普通 store 的顺序天然保持（同点、按程序序提交），
+  被分支冲刷或异常丢弃的年轻指令物理上不可能触碰设备，每条退休指令的
+  设备操作恰好发生一次。
+- **提交日志**：`RetireRecord.mmio`（及 `SeqTraceEntry.mmio`）取
+  `"read"`/`"write"`/`None`，配合 `cycle` 字段标出实际访问点。
+- 设备为纯内存状态机，不连接任何真实外设。
 
 ### 错误与异常
 
@@ -138,18 +178,24 @@ tinycpu/__init__.py     公开接口导出
 tinycpu/isa.py          指令/常量/校验/内存辅助/错误类型
 tinycpu/pipeline.py     五级流水线周期内核（被测核心）
 tinycpu/sequential.py   独立顺序参考解释器（不依赖 pipeline）
+tinycpu/mmio.py         显式地址范围的 MMIO 总线与设备状态机
 tests/test_inputs.py    输入校验与错误语义
 tests/test_pipeline.py  流水线时序：停顿/前递/冲刷/精确异常/上限
 tests/test_equivalence.py  与顺序参考的差分测试（700 个确定性随机程序）
+tests/test_mmio.py      MMIO：提交点恰好一次/冲刷/空读/连续同地址/差分
 demo.py                 固定输入演示
+demo_iteration.py       MMIO 增量演示（真实离线计算，<90 秒）
 ```
 
 ## 已知限制
 
 - 只实现题目规定的 7 条指令，不是完整 RISC-V/MIPS 行业标准实现，不做此类宣称。
+- MMIO 仅含一个读寄存器和一个写寄存器的本地状态机模型，不模拟真实外设、
+  中断或 DMA；MMIO 地址命中时优先于普通内存译码。
 - 无指令内存/取指异常概念；指令以下标数组给出，不做取指地址翻译。
-- 只有一种异常：数据访存地址错（非对齐或越界）；没有中断、系统调用、
-  除零、溢出异常（加减法按模回绕，不视为异常）。
+- 只有两种异常：数据访存地址错（非对齐、越界或 MMIO 方向不匹配）与
+  MMIO 设备空读；没有中断、系统调用、除零、溢出异常（加减法按模回绕，
+  不视为异常）。
 - BEQ 目标静态校验落在程序内；后向分支死循环由 2000 周期预算截断为
   `CycleLimitError`，这是预算限制而非程序故障。
 - 内存上限 1 MiB 为本实现的固定边界（题目未规定数据内存大小）。

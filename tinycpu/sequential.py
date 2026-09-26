@@ -20,6 +20,7 @@ from .isa import (
     Op,
     validate_program,
 )
+from .mmio import MMIO_READ, MMIO_WRITE, MMIOBus, MMIOEmptyError
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +34,7 @@ class SeqTraceEntry:
     value: Optional[int] = None
     addr: Optional[int] = None
     mem_value: Optional[int] = None
+    mmio: Optional[str] = None  # "read"/"write"：本条在提交时访问了设备
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,12 +55,17 @@ def run_sequential(
     instructions: list[Instruction] | tuple[Instruction, ...],
     memory: bytes | bytearray,
     initial_regs: Optional[list[int]] = None,
+    mmio: Optional[MMIOBus] = None,
 ) -> SeqResult:
     """顺序解释执行直到 HALT 或非法访存。
 
     与 :func:`tinycpu.pipeline.run` 使用完全相同的静态校验，
     因此两者对同一程序要么都接受、要么都拒绝。
     """
+    if mmio is not None and not isinstance(mmio, MMIOBus):
+        raise TypeError(
+            f"mmio 必须是 tinycpu.MMIOBus 或 None，收到 {type(mmio).__name__}"
+        )
     prog, mem, regs = validate_program(instructions, memory, initial_regs)
     n = len(prog)
 
@@ -101,6 +108,29 @@ def run_sequential(
             pc += 1
         elif op == Op.LOAD:
             addr = (regs[ins.rs1] + ins.imm) & MASK32
+            if mmio is not None and mmio.contains(addr):
+                if not mmio.is_read_reg(addr):
+                    fault = Fault.ADDR
+                    fault_pc = pc
+                    trace.append(SeqTraceEntry(pc, op, fault=Fault.ADDR))
+                    break
+                try:
+                    val = mmio.read()
+                except MMIOEmptyError:
+                    fault = Fault.MMIO_EMPTY
+                    fault_pc = pc
+                    trace.append(SeqTraceEntry(pc, op, fault=Fault.MMIO_EMPTY))
+                    break
+                if ins.rd != 0:
+                    regs[ins.rd] = val
+                trace.append(SeqTraceEntry(
+                    pc, op,
+                    rd=ins.rd if ins.rd else None,
+                    value=val if ins.rd else None,
+                    mmio=MMIO_READ,
+                ))
+                pc += 1
+                continue
             if not _addr_ok(addr, len(mem)):
                 fault = Fault.ADDR
                 fault_pc = pc
@@ -114,6 +144,19 @@ def run_sequential(
             pc += 1
         elif op == Op.STORE:
             addr = (regs[ins.rs1] + ins.imm) & MASK32
+            if mmio is not None and mmio.contains(addr):
+                if not mmio.is_write_reg(addr):
+                    fault = Fault.ADDR
+                    fault_pc = pc
+                    trace.append(SeqTraceEntry(pc, op, fault=Fault.ADDR))
+                    break
+                data = regs[ins.rs2]
+                mmio.write(data)
+                trace.append(SeqTraceEntry(
+                    pc, op, addr=addr, mem_value=data, mmio=MMIO_WRITE
+                ))
+                pc += 1
+                continue
             if not _addr_ok(addr, len(mem)):
                 fault = Fault.ADDR
                 fault_pc = pc

@@ -40,11 +40,14 @@ class Op(str, Enum):
 class Fault(str, Enum):
     """精确异常种类。
 
-    ADDR: LOAD/STORE 有效地址未按 4 字节对齐或越出数据内存。
+    ADDR: LOAD/STORE 有效地址未按 4 字节对齐、越出数据内存，
+        或命中 MMIO 范围但方向/对齐不匹配。
+    MMIO_EMPTY: 读 MMIO 设备寄存器时设备队列为空。
     异常在 WB 级报告（见 :mod:`tinycpu.pipeline`）。
     """
 
     ADDR = "ADDR"
+    MMIO_EMPTY = "MMIO_EMPTY"
 
 
 # 短名常量，方便 ``from tinycpu import ADD``。
