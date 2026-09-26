@@ -15,6 +15,15 @@
 * 前递：EX 取操作数时 MEM 锁存器（最新）优先，其次 WB 锁存器，
   再次 ID 级捕获的寄存器值；
 * BEQ 在 EX 决策，命中时把当周期 ID、IF 中的两条年轻指令标记为冲刷。
+
+可选的两位饱和计数器分支预测（:class:`BranchPredictor`）：
+
+* IF 取到 BEQ 时按计数器直接索引（``pc % entries``，允许别名）选出
+  预测 PC（taken -> pc+imm，否则 pc+1），预测结果随指令锁存器一路携带；
+* EX 只负责"解析"：实际方向与预测不符时冲刷 ID/IF 两条年轻指令并改 PC，
+  解析结果（已解析未提交）继续沿 EX->MEM->WB 传播；
+* 计数器训练唯一发生在 WB：只有真正退休（提交）的 BEQ 才更新计数器，
+  被冲刷/被故障丢弃的分支永不训练。
 """
 
 from __future__ import annotations
@@ -33,6 +42,57 @@ from .isa import (
 )
 
 # ---------------------------------------------------------------------------
+# 两位饱和计数器分支预测表（直接索引，允许别名）
+# ---------------------------------------------------------------------------
+
+# 计数器约定：0/1 预测 not-taken，2/3 预测 taken；
+# 实际 taken 则 +1（封顶 3），实际 not-taken 则 -1（封底 0）。
+_PRED_STRONG_NT = 0
+_PRED_WEAK_NT = 1
+_PRED_WEAK_T = 2
+_PRED_STRONG_T = 3
+
+
+class BranchPredictor:
+    """直接索引的两位饱和计数器预测表。
+
+    * ``entries``：表容量（必须为正整数），索引为 ``pc % entries``，
+      不同 PC 映射到同一项即别名碰撞，行为与真实直接索引表一致；
+    * ``initial``：所有表项初值，取值 0..3（0/1 预测不跳，2/3 预测跳）。
+
+    预测在 IF 查询；训练（:meth:`update`）只允许由 WB 提交的分支调用。
+    """
+
+    __slots__ = ("entries", "initial", "counters")
+
+    def __init__(self, entries: int, initial: int = _PRED_WEAK_NT) -> None:
+        if isinstance(entries, bool) or not isinstance(entries, int):
+            raise TypeError("predictor entries 必须是 int，不能是 bool")
+        if entries <= 0:
+            raise ValueError(f"predictor entries 必须为正整数，收到 {entries}")
+        if isinstance(initial, bool) or not isinstance(initial, int):
+            raise TypeError("predictor initial 必须是 int，不能是 bool")
+        if not 0 <= initial <= 3:
+            raise ValueError(f"predictor initial 必须在 [0, 3]，收到 {initial}")
+        self.entries = entries
+        self.initial = initial
+        self.counters = [initial] * entries
+
+    def index_of(self, pc: int) -> int:
+        """PC 到表项下标的直接索引（取模，允许别名）。"""
+        return pc % self.entries
+
+    def predict(self, pc: int) -> bool:
+        """IF 级查询：True 预测 taken。"""
+        return self.counters[pc % self.entries] >= _PRED_WEAK_T
+
+    def update(self, pc: int, taken: bool) -> None:
+        """WB 提交后训练：饱和加减。只允许对已提交分支调用。"""
+        i = pc % self.entries
+        c = self.counters[i]
+        self.counters[i] = min(_PRED_STRONG_T, c + 1) if taken else max(_PRED_STRONG_NT, c - 1)
+
+# ---------------------------------------------------------------------------
 # 对外数据结构
 # ---------------------------------------------------------------------------
 
@@ -44,6 +104,7 @@ class Slot:
     index: 指令下标（气泡且无受害者时为 None）。
     bubble: True 表示该级本周期不执行有效指令。
     reason: None 正常；"stall" load-use 气泡；"flush" 分支冲刷；
+            "mispredict" 带预测器时方向判错造成的冲刷；
             "hold" load-use 时被冻结的 IF/ID；"drain" HALT 后排空/启动填充。
     """
 
@@ -102,6 +163,10 @@ class RunResult:
     fault: Optional[Fault]
     fault_pc: Optional[int]
     fault_cycle: Optional[int]
+    # 分支预测统计（未接预测器时均为 None；接入后为非负整数）。
+    predictions: Optional[int] = None
+    mispredictions: Optional[int] = None
+    flushed_instructions: Optional[int] = None
 
     @property
     def cycles_used(self) -> int:
@@ -123,10 +188,13 @@ class _Latch:
     # EX 产物
     rs1_val: int = 0
     rs2_val: int = 0
+    # IF 级对 BEQ 的预测方向（仅 BEQ 有意义），随锁存器携带到 EX 解析。
+    pred_taken: bool = False
     result: int = 0          # ALU/ADDI 结果
     addr: int = 0            # LOAD/STORE 有效字节地址
     bad_addr: bool = False   # EX 已判定非法，但延迟到 WB 报告
     store_data: int = 0      # STORE 要写的 32 位值
+    branch_taken: bool = False  # EX 解析出的真实方向（已解析，WB 才训练）
     # MEM 产物
     load_data: int = 0
 
@@ -140,6 +208,7 @@ def run(
     instructions: list[Instruction] | tuple[Instruction, ...],
     memory: bytes | bytearray,
     initial_regs: Optional[list[int]] = None,
+    predictor: Optional[BranchPredictor] = None,
 ) -> RunResult:
     """跑五级流水线直到 HALT 退休、非法访存报告或周期预算耗尽。
 
@@ -151,6 +220,11 @@ def run(
     """
     prog, mem, regs = validate_program(instructions, memory, initial_regs)
     n = len(prog)
+
+    if predictor is not None and not isinstance(predictor, BranchPredictor):
+        raise TypeError(
+            "predictor 必须是 tinycpu.pipeline.BranchPredictor 或 None"
+        )
 
     if_id = _Latch()
     id_ex = _Latch()
@@ -165,12 +239,17 @@ def run(
     fault: Optional[Fault] = None
     fault_pc: Optional[int] = None
     fault_cycle: Optional[int] = None
+    predictions = 0 if predictor is not None else None
+    mispredictions = 0 if predictor is not None else None
+    flushed_instructions = 0 if predictor is not None else None
 
     for cycle in range(1, MAX_CYCLES + 1):
         # 本周期控制信号
         wb_fault_this_cycle = False
+        wb_halt_this_cycle = False
         stall = False
         flush = False
+        flush_reason = "flush"
         flush_victim_id: Optional[int] = None
         flush_victim_if: Optional[int] = None
 
@@ -227,7 +306,12 @@ def run(
                     rec_kwargs.update(addr=a, mem_value=mem_wb.store_data)
                 elif w.op == Op.HALT:
                     halted = True
+                    wb_halt_this_cycle = True
                 trace.append(RetireRecord(**rec_kwargs))
+                # 预测训练只由真正提交（WB 退休、无故障）的分支触发。
+                # 被冲刷的分支到不了这里；故障当周期立即停机也不会走到这。
+                if predictor is not None and w.op == Op.BEQ:
+                    predictor.update(mem_wb.pc, mem_wb.branch_taken)
 
         # ==============================================================
         # 2) MEM：LOAD 读内存（非法地址不触碰内存）；STORE 等到 WB 才写。
@@ -244,7 +328,9 @@ def run(
         # ==============================================================
         # 3) EX：ALU / 地址 / 分支决策（含前递）。
         # ==============================================================
-        if id_ex.valid and not wb_fault_this_cycle:
+        # WB 故障/HALT 退休时，本周期 EX 中的分支即使已解析也会被整体丢弃，
+        # 既不提交也不训练，故不计入预测统计（计数器也不被污染）。
+        if id_ex.valid and not wb_fault_this_cycle and not wb_halt_this_cycle:
             x = id_ex.insn
             assert x is not None
 
@@ -264,12 +350,34 @@ def run(
                 if x.op == Op.STORE:
                     id_ex.store_data = v2
             elif x.op == Op.BEQ:
-                if v1 == v2:
+                actual_taken = v1 == v2
+                id_ex.branch_taken = actual_taken
+                if predictor is None:
+                    # 基线语义：不预测，taken 才冲刷 ID/IF 两条年轻指令。
+                    mismatch = actual_taken
+                else:
+                    # 预测语义：IF 已按预测方向取指；EX 只做解析，
+                    # 方向判错才冲刷错误路径上的年轻指令并改向。
+                    mismatch = actual_taken != id_ex.pred_taken
+                if mismatch:
                     flush = True
+                    flush_reason = "mispredict" if predictor is not None else "flush"
                     flush_victim_id = if_id.pc if if_id.valid else None
                     flush_victim_if = pc if pc < n else None
-                    pc = id_ex.pc + x.imm  # 已静态校验落在 [0, n)
-                    slot_ex = Slot("EX", id_ex.pc, bubble=False, reason="take")
+                    if predictor is not None:
+                        predictions += 1
+                        mispredictions += 1
+                        if flush_victim_id is not None:
+                            flushed_instructions += 1
+                        if flush_victim_if is not None:
+                            flushed_instructions += 1
+                    # 恢复到"解析出的正确下一条 PC"。
+                    pc = id_ex.pc + (x.imm if actual_taken else 1)
+                    if predictor is None and actual_taken:
+                        slot_ex = Slot("EX", id_ex.pc, bubble=False, reason="take")
+                elif predictor is not None:
+                    # 预测正确：IF 早已沿正确路径取指，无冲刷。
+                    predictions += 1
             # HALT：EX 无动作
 
         # ==============================================================
@@ -302,9 +410,9 @@ def run(
                 slot_if = Slot("IF", pc, bubble=True, reason="fault")
         elif flush:
             if flush_victim_id is not None:
-                slot_id = Slot("ID", flush_victim_id, bubble=True, reason="flush")
+                slot_id = Slot("ID", flush_victim_id, bubble=True, reason=flush_reason)
             if flush_victim_if is not None:
-                slot_if = Slot("IF", flush_victim_if, bubble=True, reason="flush")
+                slot_if = Slot("IF", flush_victim_if, bubble=True, reason=flush_reason)
         elif stall:
             # 停顿周期：LOAD 正在 EX 执行（保持其有效槽标记），
             # ID/IF 冻结；stall 气泡要到下一周期才出现在 EX（见下沉）。
@@ -334,7 +442,7 @@ def run(
             id_ex = _Latch(bubble_reason="stall")
         elif flush:
             # 冲刷气泡下一周期在 EX 可见；IF/ID 为普通排空槽，
-            # 分支目标在新 PC 下重新取指。
+            # 正确 PC 已在 EX 改写（基线目标 / 预测判错后的恢复 PC）。
             id_ex = _Latch(bubble_reason="flush")
         else:
             id_ex = _new_id_ex(if_id, regs)
@@ -345,14 +453,31 @@ def run(
         elif flush:
             if_id = _Latch()
         else:
-            if pc < n:
-                if_id = _Latch(valid=True, pc=pc, insn=prog[pc])
+            if pc < n and not wb_fault_this_cycle:
+                fetch_pc = pc
+                fetch_insn = prog[fetch_pc]
+                pred = False
+                # 条件分支在取指时即查表选择预测 PC（无预测器时恒取 pc+1）。
+                if predictor is not None and fetch_insn.op == Op.BEQ:
+                    pred = predictor.predict(fetch_pc)
+                if_id = _Latch(
+                    valid=True, pc=fetch_pc, insn=fetch_insn, pred_taken=pred
+                )
             else:
                 if_id = _Latch()
 
-        # PC（停顿冻结；冲刷已在 EX 改写；否则 +1）
+        # PC（停顿冻结；冲刷已在 EX 改写；否则按 IF 预测方向推进）。
         if not stall and not flush:
-            pc += 1
+            if (
+                predictor is not None
+                and if_id.valid
+                and if_id.insn is not None
+                and if_id.insn.op == Op.BEQ
+                and if_id.pred_taken
+            ):
+                pc = if_id.pc + if_id.insn.imm
+            else:
+                pc += 1
 
     else:
         # for/else：预算耗尽，且最后一个周期也没有 halt/fault。
@@ -369,6 +494,9 @@ def run(
         fault=fault,
         fault_pc=fault_pc,
         fault_cycle=fault_cycle,
+        predictions=predictions,
+        mispredictions=mispredictions,
+        flushed_instructions=flushed_instructions,
     )
 
 
@@ -423,4 +551,5 @@ def _new_id_ex(if_id: _Latch, regs: list[int]) -> _Latch:
         insn=d,
         rs1_val=regs[d.rs1],
         rs2_val=regs[d.rs2],
+        pred_taken=if_id.pred_taken,
     )

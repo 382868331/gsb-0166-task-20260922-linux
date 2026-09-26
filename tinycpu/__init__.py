@@ -24,6 +24,7 @@ from .isa import (
     words_from_memory,
 )
 from .pipeline import (
+    BranchPredictor,
     CycleSlots,
     CycleLimitError,
     RetireRecord,
@@ -52,6 +53,7 @@ __all__ = [
     "TinyCPUError",
     "memory_from_words",
     "words_from_memory",
+    "BranchPredictor",
     "CycleSlots",
     "CycleLimitError",
     "RetireRecord",
