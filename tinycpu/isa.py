@@ -41,10 +41,12 @@ class Fault(str, Enum):
     """精确异常种类。
 
     ADDR: LOAD/STORE 有效地址未按 4 字节对齐或越出数据内存。
+    DEV:  设备读寄存器队列为空时被读取（MMIO）。
     异常在 WB 级报告（见 :mod:`tinycpu.pipeline`）。
     """
 
     ADDR = "ADDR"
+    DEV = "DEV"
 
 
 # 短名常量，方便 ``from tinycpu import ADD``。

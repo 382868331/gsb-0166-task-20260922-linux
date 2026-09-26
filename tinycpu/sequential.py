@@ -20,6 +20,7 @@ from .isa import (
     Op,
     validate_program,
 )
+from .mmio import DeviceEmptyError, MMIODevices, mmio_kind
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +34,7 @@ class SeqTraceEntry:
     value: Optional[int] = None
     addr: Optional[int] = None
     mem_value: Optional[int] = None
+    mmio: Optional[str] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +55,7 @@ def run_sequential(
     instructions: list[Instruction] | tuple[Instruction, ...],
     memory: bytes | bytearray,
     initial_regs: Optional[list[int]] = None,
+    devices: Optional[MMIODevices] = None,
 ) -> SeqResult:
     """顺序解释执行直到 HALT 或非法访存。
 
@@ -60,6 +63,10 @@ def run_sequential(
     因此两者对同一程序要么都接受、要么都拒绝。
     """
     prog, mem, regs = validate_program(instructions, memory, initial_regs)
+    if devices is not None and not isinstance(devices, MMIODevices):
+        raise TypeError(
+            f"devices 必须是 tinycpu.MMIODevices 或 None，收到 {type(devices).__name__}"
+        )
     n = len(prog)
 
     trace: list[SeqTraceEntry] = []
@@ -101,11 +108,30 @@ def run_sequential(
             pc += 1
         elif op == Op.LOAD:
             addr = (regs[ins.rs1] + ins.imm) & MASK32
-            if not _addr_ok(addr, len(mem)):
+            kind = mmio_kind(addr) if devices is not None else None
+            if not _addr_ok(addr, len(mem)) and kind is None:
                 fault = Fault.ADDR
                 fault_pc = pc
                 trace.append(SeqTraceEntry(pc, op, fault=Fault.ADDR))
                 break
+            if kind == "read":
+                # 设备读：该指令退休时弹出队首，恰好一次；空队列报 Fault.DEV。
+                try:
+                    val = devices.read()
+                except DeviceEmptyError:
+                    fault = Fault.DEV
+                    fault_pc = pc
+                    trace.append(SeqTraceEntry(pc, op, fault=Fault.DEV))
+                    break
+                trace.append(
+                    SeqTraceEntry(pc, op, rd=ins.rd if ins.rd else None,
+                                  value=val if ins.rd else None,
+                                  addr=addr, mmio="read")
+                )
+                if ins.rd != 0:
+                    regs[ins.rd] = val
+                pc += 1
+                continue
             val = int.from_bytes(mem[addr : addr + 4], "little")
             if ins.rd != 0:
                 regs[ins.rd] = val
@@ -114,12 +140,20 @@ def run_sequential(
             pc += 1
         elif op == Op.STORE:
             addr = (regs[ins.rs1] + ins.imm) & MASK32
-            if not _addr_ok(addr, len(mem)):
+            kind = mmio_kind(addr) if devices is not None else None
+            if not _addr_ok(addr, len(mem)) and kind is None:
                 fault = Fault.ADDR
                 fault_pc = pc
                 trace.append(SeqTraceEntry(pc, op, fault=Fault.ADDR))
                 break
             data = regs[ins.rs2]
+            if kind == "write":
+                # 设备写：该指令退休时追加写记录，恰好一次。
+                devices.write(data)
+                trace.append(SeqTraceEntry(pc, op, addr=addr, mem_value=data,
+                                           mmio="write"))
+                pc += 1
+                continue
             mem[addr : addr + 4] = data.to_bytes(4, "little")
             trace.append(SeqTraceEntry(pc, op, addr=addr, mem_value=data))
             pc += 1

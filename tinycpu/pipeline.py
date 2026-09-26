@@ -31,6 +31,7 @@ from .isa import (
     Op,
     validate_program,
 )
+from .mmio import DeviceEmptyError, MMIODevices, mmio_kind
 
 # ---------------------------------------------------------------------------
 # 对外数据结构
@@ -84,6 +85,7 @@ class RetireRecord:
     value: Optional[int] = None
     addr: Optional[int] = None
     mem_value: Optional[int] = None
+    mmio: Optional[str] = None
 
     @property
     def committed(self) -> bool:
@@ -140,6 +142,7 @@ def run(
     instructions: list[Instruction] | tuple[Instruction, ...],
     memory: bytes | bytearray,
     initial_regs: Optional[list[int]] = None,
+    devices: Optional[MMIODevices] = None,
 ) -> RunResult:
     """跑五级流水线直到 HALT 退休、非法访存报告或周期预算耗尽。
 
@@ -150,6 +153,10 @@ def run(
         CycleLimitError: 跑满 ``MAX_CYCLES`` 仍未结束（预算耗尽，区别于故障）。
     """
     prog, mem, regs = validate_program(instructions, memory, initial_regs)
+    if devices is not None and not isinstance(devices, MMIODevices):
+        raise TypeError(
+            f"devices 必须是 tinycpu.MMIODevices 或 None，收到 {type(devices).__name__}"
+        )
     n = len(prog)
 
     if_id = _Latch()
@@ -200,15 +207,28 @@ def run(
         if mem_wb.valid:
             w = mem_wb.insn
             assert w is not None
-            if w.op in (Op.LOAD, Op.STORE) and mem_wb.bad_addr:
+            # MMIO 设备读在 WB 提交点执行（恰好一次）：先尝试弹出队首，
+            # 空队列则转为 Fault.DEV，同样延迟到本周期的 WB 报告。
+            mmio = (
+                mmio_kind(mem_wb.addr)
+                if devices is not None and w.op in (Op.LOAD, Op.STORE)
+                else None
+            )
+            dev_empty = False
+            if w.op == Op.LOAD and mmio == "read" and not mem_wb.bad_addr:
+                try:
+                    mem_wb.load_data = devices.read()
+                except DeviceEmptyError:
+                    dev_empty = True
+            if (w.op in (Op.LOAD, Op.STORE) and mem_wb.bad_addr) or dev_empty:
                 # 非法访存到 WB 才报告：本指令不提交，
                 # 同周期 MEM/EX/ID/IF 全部更年轻，一律不提交。
                 wb_fault_this_cycle = True
-                fault = Fault.ADDR
+                fault = Fault.DEV if dev_empty else Fault.ADDR
                 fault_pc = mem_wb.pc
                 fault_cycle = cycle
                 trace.append(
-                    RetireRecord(cycle=cycle, pc=mem_wb.pc, op=w.op, fault=Fault.ADDR)
+                    RetireRecord(cycle=cycle, pc=mem_wb.pc, op=w.op, fault=fault)
                 )
                 slot_wb = Slot("WB", mem_wb.pc, bubble=False, reason="fault")
             else:
@@ -218,13 +238,24 @@ def run(
                         regs[w.rd] = mem_wb.result
                         rec_kwargs.update(rd=w.rd, value=mem_wb.result)
                 elif w.op == Op.LOAD:
+                    if mmio == "read":
+                        # 设备读值与内存 LOAD 一样写回并参与前递（mem_wb.load_data
+                        # 已在上面填入真实弹出值，不预测、不事后校正）。
+                        rec_kwargs.update(addr=mem_wb.addr, mmio="read")
                     if w.rd != 0:
                         regs[w.rd] = mem_wb.load_data
                         rec_kwargs.update(rd=w.rd, value=mem_wb.load_data)
                 elif w.op == Op.STORE:
-                    a = mem_wb.addr
-                    mem[a : a + 4] = mem_wb.store_data.to_bytes(4, "little")
-                    rec_kwargs.update(addr=a, mem_value=mem_wb.store_data)
+                    if mmio == "write":
+                        # 设备写在 WB 提交点追加记录，恰好一次。
+                        devices.write(mem_wb.store_data)
+                        rec_kwargs.update(
+                            addr=mem_wb.addr, mem_value=mem_wb.store_data, mmio="write"
+                        )
+                    else:
+                        a = mem_wb.addr
+                        mem[a : a + 4] = mem_wb.store_data.to_bytes(4, "little")
+                        rec_kwargs.update(addr=a, mem_value=mem_wb.store_data)
                 elif w.op == Op.HALT:
                     halted = True
                 trace.append(RetireRecord(**rec_kwargs))
@@ -237,7 +268,12 @@ def run(
         if ex_mem.valid and not wb_fault_this_cycle:
             m = ex_mem.insn
             assert m is not None
-            if m.op == Op.LOAD and not ex_mem.bad_addr:
+            # MMIO 读不在 MEM 触碰设备（等 WB 提交点），这里只读普通内存。
+            if (
+                m.op == Op.LOAD
+                and not ex_mem.bad_addr
+                and not (devices is not None and mmio_kind(ex_mem.addr) == "read")
+            ):
                 a = ex_mem.addr
                 ex_mem.load_data = int.from_bytes(mem[a : a + 4], "little")
 
@@ -260,7 +296,9 @@ def run(
             elif x.op in (Op.LOAD, Op.STORE):
                 addr = (v1 + x.imm) & MASK32
                 id_ex.addr = addr
-                id_ex.bad_addr = not _addr_ok(addr, len(mem))
+                id_ex.bad_addr = not _addr_ok(addr, len(mem)) and not (
+                    devices is not None and mmio_kind(addr) is not None
+                )
                 if x.op == Op.STORE:
                     id_ex.store_data = v2
             elif x.op == Op.BEQ:
