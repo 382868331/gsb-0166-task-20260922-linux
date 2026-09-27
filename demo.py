@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from tinycpu import (
     Instruction,
+    InterruptRequest,
     memory_from_words,
     words_from_memory,
 )
@@ -42,6 +43,8 @@ def _cell(slot) -> str:
             if slot.index is not None:
                 return f" ~flush{slot.index}"
             return " ~flush "
+        if slot.reason == "irq":
+            return f" ~irq{slot.index}"
         if slot.reason == "hold":
             return f" hold{slot.index:<3}"
         if slot.reason == "fault":
@@ -62,7 +65,8 @@ def _print_cycles(result, limit: int | None = None) -> None:
         print(f"...（共 {len(result.cycles)} 周期，以下省略）...")
     print(
         "\n图例：iN=指令N   · =启动/排空气泡   ~stall=load-use 气泡\n"
-        "      holdN=停顿冻结   ~flushN=分支冲刷受害者N   faultN=故障丢弃N   takeN=分支命中"
+        "      holdN=停顿冻结   ~flushN=分支冲刷受害者N   faultN=故障丢弃N\n"
+        "      takeN=分支命中   ~irqN=中断冲刷年轻指令N"
     )
 
 
@@ -169,7 +173,7 @@ def demo_precise_fault() -> None:
 
 
 def demo_input_rejection() -> None:
-    _bar("演示 3（输入拒绝）：bool 冒充整数 / NaN 立即数，可定位错误")
+    _bar("演示 4（输入拒绝）：bool 冒充整数 / NaN 立即数，可定位错误")
 
     try:
         Instruction.add(True, 1, 2)  # noqa: FBT003 - 故意传入 bool
@@ -190,10 +194,58 @@ def demo_input_rejection() -> None:
     print("以上错误均在任何周期执行之前抛出，无部分状态。")
 
 
+def demo_interrupt() -> None:
+    _bar("演示 3（可返回外部中断）：精确进入 handler，IRET 从断点继续")
+    prog = [
+        Instruction.addi(1, 0, 10),     # pc0  r1 = 10
+        Instruction.addi(2, 0, 20),     # pc1  r2 = 20
+        Instruction.addi(3, 0, 30),     # pc2  r3 = 30
+        Instruction.addi(4, 0, 40),     # pc3  r4 = 40
+        Instruction.addi(5, 0, 50),     # pc4  r5 = 50
+        Instruction.halt(),             # pc5
+    ]
+    handler = [
+        Instruction.addi(7, 7, 1),      # h0   r7 += 1（服务计数）
+        Instruction.iret(),             # h1   中断返回
+    ]
+    _print_program(prog)
+    print("  handler: h0 ADDI r7, r7, 1 ; h1 IRET")
+
+    # 请求 1 在周期 4 到达；请求 2 在周期 5（handler 执行期间）到达，
+    # 按电平语义保留，IRET 退休后立即补服务，不静默丢失。
+    irq = [InterruptRequest(4), InterruptRequest(5)]
+    pipe = run(prog, memory_from_words([0] * 4), interrupts=irq, handler=handler)
+    seq = run_sequential(prog, memory_from_words([0] * 4),
+                         interrupts=irq, handler=handler)
+
+    print("\n每周期流水槽：")
+    _print_cycles(pipe)
+
+    print("\n中断轨迹：")
+    for rec in pipe.interrupt_trace:
+        what = "进入 handler，保存断点" if rec.kind == "take" else "IRET 退休，恢复断点"
+        print(f"  周期{rec.cycle:>2}  {rec.kind:<6} pc{rec.pc}  {what}，")
+        print(f"           之后仍未决 {rec.pending_after} 个请求")
+
+    main_pcs = [t.pc for t in pipe.trace if t.space == "main"]
+    handler_pcs = [t.pc for t in pipe.trace if t.space == "handler"]
+    print(f"\n主程序退休序列：{main_pcs}（每条恰好一次，不重复不遗漏）")
+    print(f"handler 退休序列：{handler_pcs}（两次进入，各执行 h0/h1）")
+    print(f"最终寄存器：r1..r5 = {pipe.regs[1:6]}（期望 10/20/30/40/50），")
+    print(f"            r7 = {pipe.regs[7]}（两次服务，期望 2），")
+    print(f"            已采纳 {pipe.interrupts_taken} 次，未决 {pipe.interrupts_pending} 个")
+    assert main_pcs == [0, 1, 2, 3, 4, 5]
+    assert pipe.regs[7] == 2 and pipe.interrupts_pending == 0
+    assert pipe.regs == seq.regs and pipe.memory == seq.memory
+    print("与独立顺序参考解释器核对：寄存器 / 内存完全一致 ✔")
+
+
 def main() -> None:
     demo_normal()
     print()
     demo_precise_fault()
+    print()
+    demo_interrupt()
     print()
     demo_input_rejection()
     print("=" * WIDTH)

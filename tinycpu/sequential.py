@@ -20,6 +20,13 @@ from .isa import (
     Op,
     validate_program,
 )
+from .isa import (
+    InterruptRecord,
+    InterruptRequest,
+    ProgramError,
+    validate_handler,
+    validate_interrupts,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +40,7 @@ class SeqTraceEntry:
     value: Optional[int] = None
     addr: Optional[int] = None
     mem_value: Optional[int] = None
+    space: str = "main"
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +51,10 @@ class SeqResult:
     halted: bool
     fault: Optional[Fault]
     fault_pc: Optional[int]
+    fault_in_handler: bool = False
+    interrupts_taken: int = 0
+    interrupts_pending: int = 0
+    interrupt_trace: tuple[InterruptRecord, ...] = ()
 
 
 def _addr_ok(addr: int, mem_len: int) -> bool:
@@ -53,29 +65,49 @@ def run_sequential(
     instructions: list[Instruction] | tuple[Instruction, ...],
     memory: bytes | bytearray,
     initial_regs: Optional[list[int]] = None,
+    interrupts: Optional[list[InterruptRequest] | tuple[InterruptRequest, ...]] = None,
+    handler: Optional[list[Instruction] | tuple[Instruction, ...]] = None,
 ) -> SeqResult:
     """顺序解释执行直到 HALT 或非法访存。
 
     与 :func:`tinycpu.pipeline.run` 使用完全相同的静态校验，
     因此两者对同一程序要么都接受、要么都拒绝。
+
+    中断模型与流水线一致（电平未决、不嵌套、IRET 返回断点），
+    但本地模拟时间是"已退休指令条数"：每退休一条指令推进 1，
+    到期的请求在当前指令退休后的指令边界被采纳。
     """
     prog, mem, regs = validate_program(instructions, memory, initial_regs)
     n = len(prog)
+    if (interrupts is None) != (handler is None):
+        raise ProgramError("interrupts 与 handler 必须同时提供或同时省略")
+    handler_prog = validate_handler(handler)
+    reqs = validate_interrupts(interrupts)
+    req_idx = 0
+    pending = 0
+    in_handler = False
+    return_pc: Optional[int] = None
+    taken = 0
+    irq_records: list[InterruptRecord] = []
 
     trace: list[SeqTraceEntry] = []
     pc = 0
     halted = False
     fault: Optional[Fault] = None
     fault_pc: Optional[int] = None
+    fault_in_handler = False
     # 顺序机不会有周期预算问题，但防御失控分支：程序最多走 10_000 步。
     steps = 0
-    max_steps = 10_000
+    max_steps = 10_000 + (len(reqs) + 1) * (len(handler_prog) + 1 if handler_prog else 0)
 
     while not halted and fault is None:
         steps += 1
         if steps > max_steps:
             raise RuntimeError("顺序参考执行步数超限（程序可能含无限分支循环）")
-        ins = prog[pc]
+        cur = handler_prog if in_handler else prog
+        assert cur is not None
+        ins = cur[pc]
+        space = "handler" if in_handler else "main"
         op = ins.op
 
         if op == Op.ADD:
@@ -83,45 +115,47 @@ def run_sequential(
             if ins.rd != 0:
                 regs[ins.rd] = val
             trace.append(SeqTraceEntry(pc, op, rd=ins.rd if ins.rd else None,
-                                       value=val if ins.rd else None))
+                                       value=val if ins.rd else None, space=space))
             pc += 1
         elif op == Op.SUB:
             val = (regs[ins.rs1] - regs[ins.rs2]) & MASK32
             if ins.rd != 0:
                 regs[ins.rd] = val
             trace.append(SeqTraceEntry(pc, op, rd=ins.rd if ins.rd else None,
-                                       value=val if ins.rd else None))
+                                       value=val if ins.rd else None, space=space))
             pc += 1
         elif op == Op.ADDI:
             val = (regs[ins.rs1] + ins.imm) & MASK32
             if ins.rd != 0:
                 regs[ins.rd] = val
             trace.append(SeqTraceEntry(pc, op, rd=ins.rd if ins.rd else None,
-                                       value=val if ins.rd else None))
+                                       value=val if ins.rd else None, space=space))
             pc += 1
         elif op == Op.LOAD:
             addr = (regs[ins.rs1] + ins.imm) & MASK32
             if not _addr_ok(addr, len(mem)):
                 fault = Fault.ADDR
                 fault_pc = pc
-                trace.append(SeqTraceEntry(pc, op, fault=Fault.ADDR))
+                fault_in_handler = in_handler
+                trace.append(SeqTraceEntry(pc, op, fault=Fault.ADDR, space=space))
                 break
             val = int.from_bytes(mem[addr : addr + 4], "little")
             if ins.rd != 0:
                 regs[ins.rd] = val
             trace.append(SeqTraceEntry(pc, op, rd=ins.rd if ins.rd else None,
-                                       value=val if ins.rd else None))
+                                       value=val if ins.rd else None, space=space))
             pc += 1
         elif op == Op.STORE:
             addr = (regs[ins.rs1] + ins.imm) & MASK32
             if not _addr_ok(addr, len(mem)):
                 fault = Fault.ADDR
                 fault_pc = pc
-                trace.append(SeqTraceEntry(pc, op, fault=Fault.ADDR))
+                fault_in_handler = in_handler
+                trace.append(SeqTraceEntry(pc, op, fault=Fault.ADDR, space=space))
                 break
             data = regs[ins.rs2]
             mem[addr : addr + 4] = data.to_bytes(4, "little")
-            trace.append(SeqTraceEntry(pc, op, addr=addr, mem_value=data))
+            trace.append(SeqTraceEntry(pc, op, addr=addr, mem_value=data, space=space))
             pc += 1
         elif op == Op.BEQ:
             old_pc = pc
@@ -129,10 +163,37 @@ def run_sequential(
                 pc = old_pc + ins.imm
             else:
                 pc = old_pc + 1
-            trace.append(SeqTraceEntry(old_pc, op))
+            trace.append(SeqTraceEntry(old_pc, op, space=space))
+        elif op == Op.IRET:
+            # 中断返回：恢复主程序断点；未决请求在下方采样中立即补服务。
+            assert in_handler and return_pc is not None
+            iret_pc = pc
+            in_handler = False
+            pc = return_pc
+            return_pc = None
+            trace.append(SeqTraceEntry(iret_pc, op, space="handler"))
+            irq_records.append(InterruptRecord(steps, "return", pc, pending))
         else:  # HALT
             halted = True
-            trace.append(SeqTraceEntry(pc, op))
+            trace.append(SeqTraceEntry(pc, op, space=space))
+
+        # 中断采样（本地模拟时间 = 已退休指令条数）：故障/停机不采纳。
+        while req_idx < len(reqs) and reqs[req_idx].cycle <= steps:
+            pending += 1
+            req_idx += 1
+        if (
+            handler_prog is not None
+            and pending > 0
+            and not in_handler
+            and not halted
+            and fault is None
+        ):
+            taken += 1
+            pending -= 1
+            irq_records.append(InterruptRecord(steps, "take", pc, pending))
+            return_pc = pc
+            in_handler = True
+            pc = 0
 
     return SeqResult(
         regs=tuple(regs),
@@ -141,4 +202,8 @@ def run_sequential(
         halted=halted,
         fault=fault,
         fault_pc=fault_pc,
+        fault_in_handler=fault_in_handler,
+        interrupts_taken=taken,
+        interrupts_pending=pending + (len(reqs) - req_idx),
+        interrupt_trace=tuple(irq_records),
     )

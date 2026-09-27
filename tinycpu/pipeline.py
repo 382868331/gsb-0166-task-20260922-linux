@@ -29,7 +29,14 @@ from .isa import (
     Fault,
     Instruction,
     Op,
+    ProgramError,
     validate_program,
+)
+from .isa import (
+    InterruptRecord,
+    InterruptRequest,
+    validate_handler,
+    validate_interrupts,
 )
 
 # ---------------------------------------------------------------------------
@@ -44,7 +51,8 @@ class Slot:
     index: 指令下标（气泡且无受害者时为 None）。
     bubble: True 表示该级本周期不执行有效指令。
     reason: None 正常；"stall" load-use 气泡；"flush" 分支冲刷；
-            "hold" load-use 时被冻结的 IF/ID；"drain" HALT 后排空/启动填充。
+            "hold" load-use 时被冻结的 IF/ID；"drain" HALT 后排空/启动填充；
+            "irq" 中断采纳时被冲刷的年轻指令（未提交，返回后重新取指）。
     """
 
     stage: str
@@ -84,6 +92,8 @@ class RetireRecord:
     value: Optional[int] = None
     addr: Optional[int] = None
     mem_value: Optional[int] = None
+    # 指令所在空间："main" 主程序 / "handler" 中断处理程序。
+    space: str = "main"
 
     @property
     def committed(self) -> bool:
@@ -102,6 +112,12 @@ class RunResult:
     fault: Optional[Fault]
     fault_pc: Optional[int]
     fault_cycle: Optional[int]
+    # fault_pc 指向的空间：False=主程序，True=中断处理程序。
+    fault_in_handler: bool = False
+    # 外部中断统计与轨迹（未接中断请求时为零值/空）。
+    interrupts_taken: int = 0
+    interrupts_pending: int = 0
+    interrupt_trace: tuple[InterruptRecord, ...] = ()
 
     @property
     def cycles_used(self) -> int:
@@ -140,10 +156,20 @@ def run(
     instructions: list[Instruction] | tuple[Instruction, ...],
     memory: bytes | bytearray,
     initial_regs: Optional[list[int]] = None,
+    interrupts: Optional[list[InterruptRequest] | tuple[InterruptRequest, ...]] = None,
+    handler: Optional[list[Instruction] | tuple[Instruction, ...]] = None,
 ) -> RunResult:
     """跑五级流水线直到 HALT 退休、非法访存报告或周期预算耗尽。
 
     参数静态校验全部在第一条指令执行前完成，失败不会产生任何部分结果。
+
+    interrupts/handler（必须同时提供或同时省略）启用可返回外部中断：
+    InterruptRequest(cycle) 在本地模拟时间（周期）到达；中断只在 WB
+    提交之后的指令边界被采纳（精确现场），未提交的年轻指令全部冲刷，
+    断点取最老未提交指令；handler 以 IRET 结尾，IRET 在 WB 退休时恢复
+    断点继续执行。同周期优先级：WB 故障 > HALT 退休 > 中断采纳；
+    handler 内不嵌套，期间到达的请求计入未决（不静默丢失），
+    IRET 退休后立即补服务。
 
     Raises:
         TypeError/ValueError/ProgramError: 输入不合法。
@@ -151,6 +177,18 @@ def run(
     """
     prog, mem, regs = validate_program(instructions, memory, initial_regs)
     n = len(prog)
+    if (interrupts is None) != (handler is None):
+        raise ProgramError("interrupts 与 handler 必须同时提供或同时省略")
+    handler_prog = validate_handler(handler)
+    reqs = validate_interrupts(interrupts)
+
+    # 中断状态：电平未决计数，绝不静默丢弃。
+    req_idx = 0
+    pending = 0
+    in_handler = False
+    return_pc: Optional[int] = None
+    taken = 0
+    irq_records: list[InterruptRecord] = []
 
     if_id = _Latch()
     id_ex = _Latch()
@@ -165,6 +203,7 @@ def run(
     fault: Optional[Fault] = None
     fault_pc: Optional[int] = None
     fault_cycle: Optional[int] = None
+    fault_in_handler = False
 
     for cycle in range(1, MAX_CYCLES + 1):
         # 本周期控制信号
@@ -173,10 +212,14 @@ def run(
         flush = False
         flush_victim_id: Optional[int] = None
         flush_victim_if: Optional[int] = None
+        iret_retired = False
+        cur_prog = handler_prog if in_handler else prog
+        assert cur_prog is not None
+        cur_n = len(cur_prog)
 
         # ---- 记录本周期各级"占据者"（控制信号可能改写 ID/IF 的标记） ----
-        slot_if = Slot("IF", pc if pc < n else None, pc >= n,
-                       "drain" if pc >= n else None)
+        slot_if = Slot("IF", pc if pc < cur_n else None, pc >= cur_n,
+                       "drain" if pc >= cur_n else None)
         slot_id = Slot(
             "ID", if_id.pc if if_id.valid else None, bubble=not if_id.valid,
             reason=None if if_id.valid else "drain",
@@ -207,12 +250,17 @@ def run(
                 fault = Fault.ADDR
                 fault_pc = mem_wb.pc
                 fault_cycle = cycle
+                fault_in_handler = in_handler
                 trace.append(
-                    RetireRecord(cycle=cycle, pc=mem_wb.pc, op=w.op, fault=Fault.ADDR)
+                    RetireRecord(cycle=cycle, pc=mem_wb.pc, op=w.op, fault=Fault.ADDR,
+                                 space="handler" if in_handler else "main")
                 )
                 slot_wb = Slot("WB", mem_wb.pc, bubble=False, reason="fault")
             else:
-                rec_kwargs: dict = {"cycle": cycle, "pc": mem_wb.pc, "op": w.op}
+                rec_kwargs: dict = {
+                    "cycle": cycle, "pc": mem_wb.pc, "op": w.op,
+                    "space": "handler" if in_handler else "main",
+                }
                 if w.op in (Op.ADD, Op.SUB, Op.ADDI):
                     if w.rd != 0:
                         regs[w.rd] = mem_wb.result
@@ -227,7 +275,20 @@ def run(
                     rec_kwargs.update(addr=a, mem_value=mem_wb.store_data)
                 elif w.op == Op.HALT:
                     halted = True
+                elif w.op == Op.IRET:
+                    # 中断返回：handler 末尾，此时管线已排空，
+                    # 在 WB 恢复主程序断点（提交点唯一在 WB，现场精确）。
+                    iret_retired = True
                 trace.append(RetireRecord(**rec_kwargs))
+
+        if iret_retired:
+            assert return_pc is not None
+            in_handler = False
+            pc = return_pc
+            return_pc = None
+            irq_records.append(InterruptRecord(cycle, "return", pc, pending))
+            cur_prog = prog
+            cur_n = n
 
         # ==============================================================
         # 2) MEM：LOAD 读内存（非法地址不触碰内存）；STORE 等到 WB 才写。
@@ -311,6 +372,42 @@ def run(
             slot_id = Slot("ID", if_id.pc, bubble=False, reason="hold")
             slot_if = Slot("IF", pc, bubble=False, reason="hold")
 
+        # ==============================================================
+        # 外部中断采样：本周期 WB 提交之后、锁存器下沉之前。
+        # 优先级：WB 故障 > HALT 退休 > 中断采纳；分支在 EX 的改向
+        # 是推测性的，若同周期中断被采纳，整管线年轻指令（含该分支）
+        # 一并冲刷，断点取最老未提交指令，分支返回后重新执行。
+        # ==============================================================
+        while req_idx < len(reqs) and reqs[req_idx].cycle <= cycle:
+            pending += 1
+            req_idx += 1
+        irq_take = (
+            handler_prog is not None
+            and pending > 0
+            and not in_handler
+            and not wb_fault_this_cycle
+            and not halted
+        )
+        irq_resume_pc: Optional[int] = None
+        if irq_take:
+            # 断点 = 最老未提交指令（MEM->EX->ID->IF），保证不重复不遗漏。
+            if ex_mem.valid:
+                irq_resume_pc = ex_mem.pc
+            elif id_ex.valid:
+                irq_resume_pc = id_ex.pc
+            elif if_id.valid:
+                irq_resume_pc = if_id.pc
+            else:
+                irq_resume_pc = pc
+            if ex_mem.valid:
+                slot_me = Slot("MEM", ex_mem.pc, bubble=True, reason="irq")
+            if id_ex.valid:
+                slot_ex = Slot("EX", id_ex.pc, bubble=True, reason="irq")
+            if if_id.valid:
+                slot_id = Slot("ID", if_id.pc, bubble=True, reason="irq")
+            if pc < cur_n:
+                slot_if = Slot("IF", pc, bubble=True, reason="irq")
+
         cycle_log.append(
             CycleSlots(cycle, (slot_if, slot_id, slot_ex, slot_me, slot_wb))
         )
@@ -320,6 +417,24 @@ def run(
             break
         if halted:
             break
+
+        if irq_take:
+            # 采纳中断：冲刷全部未提交指令（未提交 => 无架构效果），
+            # 保存断点，下周期起从 handler 入口取指。
+            assert irq_resume_pc is not None
+            taken += 1
+            pending -= 1
+            irq_records.append(
+                InterruptRecord(cycle, "take", irq_resume_pc, pending)
+            )
+            return_pc = irq_resume_pc
+            in_handler = True
+            if_id = _Latch()
+            id_ex = _Latch()
+            ex_mem = _Latch()
+            mem_wb = _Latch()
+            pc = 0
+            continue
 
         # ==============================================================
         # 锁存器下沉（组合逻辑结果在本周期末打入）。
@@ -345,12 +460,13 @@ def run(
         elif flush:
             if_id = _Latch()
         else:
-            if pc < n:
-                if_id = _Latch(valid=True, pc=pc, insn=prog[pc])
+            if pc < cur_n:
+                if_id = _Latch(valid=True, pc=pc, insn=cur_prog[pc])
             else:
                 if_id = _Latch()
 
-        # PC（停顿冻结；冲刷已在 EX 改写；否则 +1）
+        # PC（停顿冻结；冲刷已在 EX 改写；否则 +1。IRET 退休周期 pc 已
+        # 恢复为断点，本周期末正常取指并 +1，不会重复取指）
         if not stall and not flush:
             pc += 1
 
@@ -369,6 +485,10 @@ def run(
         fault=fault,
         fault_pc=fault_pc,
         fault_cycle=fault_cycle,
+        fault_in_handler=fault_in_handler,
+        interrupts_taken=taken,
+        interrupts_pending=pending + (len(reqs) - req_idx),
+        interrupt_trace=tuple(irq_records),
     )
 
 

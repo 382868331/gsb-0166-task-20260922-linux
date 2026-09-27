@@ -26,7 +26,10 @@ IMM_MAX = (1 << 31) - 1
 
 
 class Op(str, Enum):
-    """七条指令。枚举值同时是对外可见的规范短名。"""
+    """八条指令。枚举值同时是对外可见的规范短名。
+
+    IRET 只允许出现在中断处理程序（handler）末尾，主程序中出现即拒绝。
+    """
 
     ADD = "ADD"
     SUB = "SUB"
@@ -34,6 +37,7 @@ class Op(str, Enum):
     LOAD = "LOAD"
     STORE = "STORE"
     BEQ = "BEQ"
+    IRET = "IRET"
     HALT = "HALT"
 
 
@@ -54,6 +58,7 @@ ADDI = Op.ADDI
 LOAD = Op.LOAD
 STORE = Op.STORE
 BEQ = Op.BEQ
+IRET = Op.IRET
 HALT = Op.HALT
 
 
@@ -134,6 +139,7 @@ class Instruction:
     LOAD 目标    基址    -       字节偏移（符号加）
     STORE -      基址    存数    字节偏移（符号加）
     BEQ  -       源 1    源 2    字偏移（PC 相对，符号）
+    IRET -       -       -       -       （仅 handler 末尾：中断返回）
     HALT -       -       -       -
     ==== ======= ======= ======= =========================
 
@@ -203,6 +209,10 @@ class Instruction:
         return cls(Op.BEQ, rs1=rs1, rs2=rs2, imm=offset_words)
 
     @classmethod
+    def iret(cls) -> "Instruction":
+        return cls(Op.IRET)
+
+    @classmethod
     def halt(cls) -> "Instruction":
         return cls(Op.HALT)
 
@@ -225,6 +235,8 @@ class Instruction:
         if self.op == Op.BEQ:
             sign = "+" if self.imm >= 0 else ""
             return f"BEQ r{self.rs1}, r{self.rs2}, {sign}{self.imm}"
+        if self.op == Op.IRET:
+            return "IRET"
         return "HALT"
 
 
@@ -296,6 +308,13 @@ def validate_program(
     if prog[-1].op != Op.HALT:
         raise ProgramError("程序最后一条指令必须是 HALT")
 
+    # IRET 只在中断处理程序中有意义；主程序出现即拒绝（错误可定位）。
+    for i, instr in enumerate(prog):
+        if instr.op == Op.IRET:
+            raise ProgramError(
+                f"instructions[{i}] IRET 只允许出现在中断处理程序（handler）末尾"
+            )
+
     # 分支目标静态可查（立即数固定），提前判非法，错误可定位到指令下标。
     for i, instr in enumerate(prog):
         if instr.op == Op.BEQ:
@@ -336,3 +355,104 @@ def validate_program(
             raise ProgramError("initial_regs[0] 必须为 0（r0 恒零）")
 
     return tuple(prog), mem, regs
+
+
+# ---------------------------------------------------------------------------
+# 外部中断：请求、处理程序与进入/返回记录
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class InterruptRequest:
+    """一个外部中断请求：在本地模拟时间（流水线周期）cycle 到达。
+
+    请求是电平语义：到达后若不能立即被采纳（机器正处 handler、
+    或同周期有故障/HALT 退休），进入未决计数，绝不静默丢弃；
+    运行结束时仍未服务的个数在 RunResult.interrupts_pending 中报告。
+    """
+
+    cycle: int
+
+    def __post_init__(self) -> None:
+        v = check_int("InterruptRequest.cycle", self.cycle)
+        if not 1 <= v <= MAX_CYCLES:
+            raise ValueError(
+                f"中断请求周期必须在 [1, {MAX_CYCLES}]，收到 {v}"
+            )
+        object.__setattr__(self, "cycle", v)
+
+
+@dataclass(frozen=True, slots=True)
+class InterruptRecord:
+    """中断进入/返回轨迹中的一条。
+
+    kind: "take"（采纳并进入 handler）或 "return"（IRET 退休，恢复断点）。
+    pc:   take 时为被保存的主程序断点（最老未提交指令下标）；
+          return 时为恢复执行的主程序断点。两者必然相等。
+    pending_after: 本事件发生后仍未决的请求个数。
+    """
+
+    cycle: int
+    kind: str
+    pc: int
+    pending_after: int
+
+
+def validate_interrupts(
+    interrupts: Optional[Sequence[InterruptRequest]],
+) -> tuple[InterruptRequest, ...]:
+    """校验中断请求序列并按周期升序排序（同周期请求保持先后）。"""
+    if interrupts is None:
+        return ()
+    if isinstance(interrupts, (str, bytes)) or not isinstance(
+        interrupts, Sequence
+    ):
+        raise TypeError("interrupts 必须是 InterruptRequest 序列（list/tuple）")
+    if len(interrupts) > MAX_CYCLES:
+        raise ProgramError(
+            f"中断请求个数超过实现上限 {MAX_CYCLES}，收到 {len(interrupts)}"
+        )
+    reqs: list[InterruptRequest] = []
+    for i, r in enumerate(interrupts):
+        if not isinstance(r, InterruptRequest):
+            raise TypeError(
+                f"interrupts[{i}] 必须是 InterruptRequest，收到 {type(r).__name__}"
+            )
+        reqs.append(r)
+    return tuple(sorted(reqs, key=lambda r: r.cycle))
+
+
+def validate_handler(
+    handler: Optional[Sequence[Instruction]],
+) -> Optional[tuple[Instruction, ...]]:
+    """校验中断处理程序：1-200 条、以 IRET 结尾、无 HALT、IRET 唯一、
+    BEQ 目标落在 handler 内部。返回可执行副本；None 表示无 handler。"""
+    if handler is None:
+        return None
+    if isinstance(handler, (str, bytes)) or not isinstance(handler, Sequence):
+        raise TypeError("handler 必须是 Instruction 序列（list/tuple）")
+    n = len(handler)
+    if not 1 <= n <= MAX_INSTRUCTIONS:
+        raise ProgramError(f"handler 条数必须在 [1, {MAX_INSTRUCTIONS}]，收到 {n}")
+    prog: list[Instruction] = []
+    for i, instr in enumerate(handler):
+        if not isinstance(instr, Instruction):
+            raise TypeError(
+                f"handler[{i}] 必须是 Instruction，收到 {type(instr).__name__}"
+            )
+        prog.append(instr)
+    if prog[-1].op != Op.IRET:
+        raise ProgramError("handler 最后一条指令必须是 IRET（中断返回）")
+    for i, instr in enumerate(prog):
+        if instr.op == Op.HALT:
+            raise ProgramError(f"handler[{i}] 不允许出现 HALT（handler 以 IRET 结束）")
+        if instr.op == Op.IRET and i != n - 1:
+            raise ProgramError(f"handler[{i}] IRET 只允许出现在 handler 末尾")
+        if instr.op == Op.BEQ:
+            target = i + instr.imm
+            if not 0 <= target < n:
+                raise ProgramError(
+                    f"handler[{i}] BEQ 目标越界：{i} + {instr.imm} = {target}，"
+                    f"合法范围 [0, {n - 1}]"
+                )
+    return tuple(prog)
