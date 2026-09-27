@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Optional
 
@@ -91,6 +92,49 @@ class RetireRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class InterruptRequest:
+    """一个在指定本地模拟周期到达的外部中断请求。"""
+
+    cycle: int
+    code: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class InterruptContext:
+    """进入中断时传给处理回调的一致架构状态。
+
+    ``regs``/``memory`` 是进入边界时架构状态的副本；回调可有意修改它们来模拟
+    中断处理程序的架构副作用，校验成功后原子应用。普通观察型回调无需修改。
+    """
+
+    cycle: int
+    code: int
+    committed_pc: int
+    resume_pc: int
+    regs: list[int]
+    memory: bytearray
+
+
+@dataclass(frozen=True, slots=True)
+class InterruptRecord:
+    """外部中断请求的处置记录。
+
+    status:
+      ``"ENTERED"``  已在 WB 边界进入并完成处理；
+      ``"REJECTED"`` 因单请求挂起位/处理中占用而按策略显式拒绝。
+    """
+
+    request_cycle: int
+    code: int
+    status: str
+    entry_cycle: Optional[int] = None
+    service_cycles: Optional[int] = None
+    resume_cycle: Optional[int] = None
+    committed_pc: Optional[int] = None
+    resume_pc: Optional[int] = None
+
+
+@dataclass(frozen=True, slots=True)
 class RunResult:
     """一次流水线运行的完整结果。"""
 
@@ -102,6 +146,9 @@ class RunResult:
     fault: Optional[Fault]
     fault_pc: Optional[int]
     fault_cycle: Optional[int]
+    interrupts: tuple[InterruptRecord, ...] = ()
+    rejected_interrupts: tuple[InterruptRecord, ...] = ()
+    pending_interrupt: Optional[InterruptRequest] = None
 
     @property
     def cycles_used(self) -> int:
@@ -127,6 +174,8 @@ class _Latch:
     addr: int = 0            # LOAD/STORE 有效字节地址
     bad_addr: bool = False   # EX 已判定非法，但延迟到 WB 报告
     store_data: int = 0      # STORE 要写的 32 位值
+    branch_taken: bool = False
+    branch_target: int = 0
     # MEM 产物
     load_data: int = 0
 
@@ -140,6 +189,10 @@ def run(
     instructions: list[Instruction] | tuple[Instruction, ...],
     memory: bytes | bytearray,
     initial_regs: Optional[list[int]] = None,
+    interrupts: Sequence[InterruptRequest] = (),
+    interrupt_handler: Optional[Callable[[InterruptContext], Optional[int]]] = None,
+    interrupt_service_cycles: int = 1,
+    interrupt_on_busy: str = "reject",
 ) -> RunResult:
     """跑五级流水线直到 HALT 退休、非法访存报告或周期预算耗尽。
 
@@ -151,6 +204,9 @@ def run(
     """
     prog, mem, regs = validate_program(instructions, memory, initial_regs)
     n = len(prog)
+    requests = _validate_interrupts(
+        interrupts, interrupt_service_cycles, interrupt_on_busy
+    )
 
     if_id = _Latch()
     id_ex = _Latch()
@@ -165,8 +221,59 @@ def run(
     fault: Optional[Fault] = None
     fault_pc: Optional[int] = None
     fault_cycle: Optional[int] = None
+    interrupt_log: list[InterruptRecord] = []
+    rejected_interrupts: list[InterruptRecord] = []
+    pending_interrupt: Optional[InterruptRequest] = None
+    service_remaining = 0
+    active_interrupt: Optional[InterruptRequest] = None
+    active_resume_pc = 0
+    active_committed_pc = 0
+    active_service_cycles = 0
+    request_by_cycle: dict[int, list[InterruptRequest]] = {}
+    for request in requests:
+        request_by_cycle.setdefault(request.cycle, []).append(request)
 
     for cycle in range(1, MAX_CYCLES + 1):
+        # 请求按本地周期到达；即使本拍正在服务，也要先完成保留/拒绝仲裁。
+        for request in request_by_cycle.get(cycle, ()):
+            can_accept = service_remaining == 0 or pending_interrupt is None
+            if pending_interrupt is None and can_accept:
+                pending_interrupt = request
+            elif interrupt_on_busy == "reject":
+                rejected_interrupts.append(
+                    InterruptRecord(request.cycle, request.code, "REJECTED")
+                )
+            else:
+                old = pending_interrupt
+                if old is not None:
+                    rejected_interrupts.append(
+                        InterruptRecord(old.cycle, old.code, "REJECTED")
+                    )
+                pending_interrupt = request
+
+        if service_remaining > 0:
+            assert active_interrupt is not None
+            service_remaining -= 1
+            slots = tuple(
+                Slot(stage, None, bubble=True, reason="iservice")
+                for stage in ("IF", "ID", "EX", "MEM", "WB")
+            )
+            cycle_log.append(CycleSlots(cycle, slots))
+            if service_remaining == 0:
+                interrupt_log.append(
+                    InterruptRecord(
+                        request_cycle=active_interrupt.cycle,
+                        code=active_interrupt.code,
+                        status="ENTERED",
+                        entry_cycle=cycle - active_service_cycles + 1,
+                        service_cycles=active_service_cycles,
+                        resume_cycle=cycle + 1,
+                        committed_pc=active_committed_pc,
+                        resume_pc=active_resume_pc,
+                    )
+                )
+            continue
+
         # 本周期控制信号
         wb_fault_this_cycle = False
         stall = False
@@ -266,9 +373,11 @@ def run(
             elif x.op == Op.BEQ:
                 if v1 == v2:
                     flush = True
+                    id_ex.branch_taken = True
+                    id_ex.branch_target = id_ex.pc + x.imm
                     flush_victim_id = if_id.pc if if_id.valid else None
                     flush_victim_if = pc if pc < n else None
-                    pc = id_ex.pc + x.imm  # 已静态校验落在 [0, n)
+                    pc = id_ex.branch_target  # 已静态校验落在 [0, n)
                     slot_ex = Slot("EX", id_ex.pc, bubble=False, reason="take")
             # HALT：EX 无动作
 
@@ -321,14 +430,94 @@ def run(
         if halted:
             break
 
+        entered_interrupt = False
+        if pending_interrupt is not None and mem_wb.valid:
+            committed = mem_wb
+            if committed.insn is None:
+                raise RuntimeError("有效的 WB 锁存器缺少指令")
+            if committed.insn.op == Op.BEQ:
+                resume_pc = (
+                    committed.branch_target
+                    if committed.branch_taken
+                    else committed.pc + 1
+                )
+            else:
+                resume_pc = committed.pc + 1
+
+            context = InterruptContext(
+                cycle=cycle,
+                code=pending_interrupt.code,
+                committed_pc=committed.pc,
+                resume_pc=resume_pc,
+                regs=regs.copy(),
+                memory=bytearray(mem),
+            )
+            requested_cycles = (
+                interrupt_handler(context) if interrupt_handler is not None else None
+            )
+            service_cycles = (
+                requested_cycles
+                if requested_cycles is not None
+                else interrupt_service_cycles
+            )
+            if not isinstance(service_cycles, int) or isinstance(service_cycles, bool):
+                raise TypeError("中断处理时长必须是 int")
+            if service_cycles < 1:
+                raise ValueError("中断处理时长必须至少为 1 个本地周期")
+            if cycle + service_cycles > MAX_CYCLES:
+                raise CycleLimitError(
+                    f"中断处理需要 {service_cycles} 周期，超过 {MAX_CYCLES} 周期预算"
+                )
+            context.regs[0] = 0
+            regs[:] = context.regs
+            mem[:] = context.memory
+            active_interrupt = pending_interrupt
+            pending_interrupt = None
+            active_service_cycles = service_cycles
+            active_resume_pc = resume_pc
+            active_committed_pc = committed.pc
+            service_remaining = service_cycles - 1
+            cycle_log[-1] = CycleSlots(
+                cycle,
+                tuple(
+                    Slot(slot.stage, slot.index, bubble=True, reason="iservice")
+                    for slot in cycle_log[-1].slots
+                ),
+            )
+            if service_remaining == 0:
+                interrupt_log.append(
+                    InterruptRecord(
+                        request_cycle=active_interrupt.cycle,
+                        code=active_interrupt.code,
+                        status="ENTERED",
+                        entry_cycle=cycle,
+                        service_cycles=1,
+                        resume_cycle=cycle + 1,
+                        committed_pc=committed.pc,
+                        resume_pc=resume_pc,
+                    )
+                )
+                active_interrupt = None
+            entered_interrupt = True
+
+            # 所有未到 WB 的年轻指令都没有架构效果；清管后从精确 PC 重新取指。
+            mem_wb = _Latch()
+            ex_mem = _Latch()
+            id_ex = _Latch()
+            if_id = _Latch()
+            pc = resume_pc
+
         # ==============================================================
         # 锁存器下沉（组合逻辑结果在本周期末打入）。
         # ==============================================================
         # WB <- MEM，MEM <- EX（整条锁存器复制）。
-        mem_wb = ex_mem
-        ex_mem = id_ex
+        if not entered_interrupt:
+            mem_wb = ex_mem
+            ex_mem = id_ex
         # EX <- ID
-        if stall:
+        if entered_interrupt:
+            pass
+        elif stall:
             # LOAD 已正常进入 MEM；此处插入 stall 气泡（下一周期在 EX 可见），
             # IF/ID 保持冻结。
             id_ex = _Latch(bubble_reason="stall")
@@ -340,7 +529,9 @@ def run(
             id_ex = _new_id_ex(if_id, regs)
 
         # ID <- IF（停顿保持；冲刷插普通气泡；否则取当前 PC 指令）
-        if stall:
+        if entered_interrupt:
+            pass
+        elif stall:
             pass  # if_id 保持
         elif flush:
             if_id = _Latch()
@@ -351,7 +542,7 @@ def run(
                 if_id = _Latch()
 
         # PC（停顿冻结；冲刷已在 EX 改写；否则 +1）
-        if not stall and not flush:
+        if not entered_interrupt and not stall and not flush:
             pc += 1
 
     else:
@@ -369,7 +560,43 @@ def run(
         fault=fault,
         fault_pc=fault_pc,
         fault_cycle=fault_cycle,
+        interrupts=tuple(interrupt_log),
+        rejected_interrupts=tuple(rejected_interrupts),
+        pending_interrupt=pending_interrupt,
     )
+
+
+def _validate_interrupts(
+    interrupts: Sequence[InterruptRequest],
+    service_cycles: int,
+    on_busy: str,
+) -> tuple[InterruptRequest, ...]:
+    if isinstance(interrupts, (str, bytes)) or not isinstance(interrupts, Sequence):
+        raise TypeError("interrupts 必须是 InterruptRequest 序列")
+    requests: list[InterruptRequest] = []
+    for i, request in enumerate(interrupts):
+        if not isinstance(request, InterruptRequest):
+            raise TypeError(
+                f"interrupts[{i}] 必须是 InterruptRequest，收到 {type(request).__name__}"
+            )
+        if not 1 <= request.cycle <= MAX_CYCLES:
+            raise ValueError(
+                f"interrupts[{i}].cycle 必须在 [1, {MAX_CYCLES}]，收到 {request.cycle}"
+            )
+        if not isinstance(request.code, int) or isinstance(request.code, bool):
+            raise TypeError(f"interrupts[{i}].code 必须是 int")
+        if not 0 <= request.code <= MASK32:
+            raise ValueError(f"interrupts[{i}].code 必须是 32 位无符号数")
+        requests.append(request)
+    if isinstance(service_cycles, bool) or not isinstance(service_cycles, int):
+        raise TypeError("interrupt_service_cycles 必须是 int")
+    if not 1 <= service_cycles <= MAX_CYCLES:
+        raise ValueError(
+            f"interrupt_service_cycles 必须在 [1, {MAX_CYCLES}]，收到 {service_cycles}"
+        )
+    if on_busy not in ("reject", "replace"):
+        raise ValueError('interrupt_on_busy 必须是 "reject" 或 "replace"')
+    return tuple(sorted(requests, key=lambda item: (item.cycle, item.code)))
 
 
 # ---------------------------------------------------------------------------

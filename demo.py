@@ -7,12 +7,14 @@
    打印每周期流水槽、退休轨迹，并与独立顺序参考解释器核对；
 2. 异常边界：分支冲刷后紧跟非法 STORE，验证"非法访存到 WB 才报告、
    年轻 STORE 不写内存、老指令正常提交"；
-3. 输入拒绝：bool 冒充寄存器号被可定位地拒绝。
+3. 外部中断：WB 边界进入、本地服务周期、从正确 PC 恢复、处理中请求保留/拒绝；
+4. 输入拒绝：bool 冒充寄存器号被可定位地拒绝。
 """
 
 from __future__ import annotations
 
 from tinycpu import (
+    InterruptRequest,
     Instruction,
     memory_from_words,
     words_from_memory,
@@ -44,6 +46,8 @@ def _cell(slot) -> str:
             return " ~flush "
         if slot.reason == "hold":
             return f" hold{slot.index:<3}"
+        if slot.reason == "iservice":
+            return " iserv  "
         if slot.reason == "fault":
             return f" fault{slot.index:<2}"
         if slot.reason == "take":
@@ -62,7 +66,8 @@ def _print_cycles(result, limit: int | None = None) -> None:
         print(f"...（共 {len(result.cycles)} 周期，以下省略）...")
     print(
         "\n图例：iN=指令N   · =启动/排空气泡   ~stall=load-use 气泡\n"
-        "      holdN=停顿冻结   ~flushN=分支冲刷受害者N   faultN=故障丢弃N   takeN=分支命中"
+        "      holdN=停顿冻结   ~flushN=分支冲刷受害者N   faultN=故障丢弃N\n"
+        "      iserv=外部中断服务   takeN=分支命中"
     )
 
 
@@ -168,8 +173,64 @@ def demo_precise_fault() -> None:
     print("与独立顺序参考解释器核对：故障位置与异常前内存完全一致 ✔")
 
 
+def demo_interrupt() -> None:
+    _bar("演示 3（可返回外部中断）：WB 一致边界、处理中请求保留/拒绝、精确恢复")
+    prog = [
+        Instruction.addi(1, 0, 10),      # pc0
+        Instruction.addi(2, 0, 20),      # pc1
+        Instruction.addi(3, 1, 2),       # pc2
+        Instruction.addi(4, 3, 4),       # pc3
+        Instruction.halt(),              # pc4
+    ]
+    _print_program(prog)
+
+    def handler(ctx):
+        ctx.regs[20] = 100 + ctx.code
+        ctx.memory[0:4] = ctx.regs[20].to_bytes(4, "little")
+        print(
+            f"  进入 code={ctx.code}: 已提交 pc{ctx.committed_pc}，"
+            f"服务后从 pc{ctx.resume_pc} 恢复"
+        )
+        return 2
+
+    result = run(
+        prog,
+        memory_from_words([0]),
+        interrupts=[
+            InterruptRequest(1, code=1),   # 等 pc0 在周期 5 退休
+            InterruptRequest(6, code=2),   # 第一次处理中：保留
+            InterruptRequest(6, code=3),   # 第一次处理中且已有挂起：拒绝
+        ],
+        interrupt_handler=handler,
+    )
+
+    print("\n中断前后周期流水槽：")
+    _print_cycles(result)
+    print("\n中断记录：")
+    for item in result.interrupts:
+        print(
+            f"  code={item.code} 请求周期={item.request_cycle} "
+            f"进入周期={item.entry_cycle} 服务={item.service_cycles}拍 "
+            f"恢复周期={item.resume_cycle} 从 pc{item.resume_pc} 继续"
+        )
+    for item in result.rejected_interrupts:
+        print(f"  code={item.code} 请求周期={item.request_cycle} 状态={item.status}")
+
+    print("\n退休轨迹：", [t.pc for t in result.trace])
+    print(
+        f"最终 r1={result.regs[1]} r2={result.regs[2]} r3={result.regs[3]} "
+        f"r4={result.regs[4]} r20={result.regs[20]}；"
+        f"mem[0]={words_from_memory(result.memory)[0]}"
+    )
+    print(f"总本地周期={result.cycles_used}，HALT={result.halted}，异常={result.fault}")
+    assert [t.pc for t in result.trace] == [0, 1, 2, 3, 4]
+    assert [i.code for i in result.interrupts] == [1, 2]
+    assert [i.code for i in result.rejected_interrupts] == [3]
+    print("两次中断各提交一次；原程序每条指令仍严格退休一次，code=3 已显式拒绝 ✔")
+
+
 def demo_input_rejection() -> None:
-    _bar("演示 3（输入拒绝）：bool 冒充整数 / NaN 立即数，可定位错误")
+    _bar("演示 4（输入拒绝）：bool 冒充整数 / NaN 立即数，可定位错误")
 
     try:
         Instruction.add(True, 1, 2)  # noqa: FBT003 - 故意传入 bool
@@ -194,6 +255,8 @@ def main() -> None:
     demo_normal()
     print()
     demo_precise_fault()
+    print()
+    demo_interrupt()
     print()
     demo_input_rejection()
     print("=" * WIDTH)

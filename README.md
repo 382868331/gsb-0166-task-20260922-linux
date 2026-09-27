@@ -1,8 +1,9 @@
-# tinycpu —— 精确异常的五级流水线 CPU 模拟模块
+# tinycpu —— 精确异常与可返回外部中断的五级流水线 CPU 模拟模块
 
 一个教学用、可导入的 32 位小 CPU 周期精确内核：实现 IF/ID/EX/MEM/WB 五级
 流水线、EX 级操作数前递、load-use 停顿、分支冲刷，以及**精确异常**
 （非法访存延迟到 WB 才报告，年轻指令不得提交，老指令正常退休）。
+外部中断同样只在 WB 提交边界进入，并在本地模拟服务周期结束后从精确 PC 继续。
 另附一个**独立**的无流水顺序参考解释器，用于交叉验证。
 
 仅使用 Python 3.14.7 标准库，零第三方依赖，完全离线运行。
@@ -16,10 +17,10 @@
 在本目录（含 `tinycpu/`、`tests/`、`demo.py` 的目录）执行：
 
 ```bash
-# 必要测试（39 个用例，含 700 个确定性随机程序的差分测试）
+# 必要测试（48 个用例，含 700 个确定性随机程序的差分测试）
 python -m unittest discover -s tests -v
 
-# 固定输入演示：正常结果（含气泡/冲刷）+ 实际触发的异常边界 + 输入拒绝
+# 固定输入演示：正常结果、异常边界、可返回外部中断 + 输入拒绝
 python demo.py
 ```
 
@@ -54,9 +55,17 @@ Instruction.halt()
 
 ## 公开接口
 
-### `tinycpu.run(instructions, memory, initial_regs=None) -> RunResult`
+### `tinycpu.run(instructions, memory, initial_regs=None, ...) -> RunResult`
 
 五级流水线执行直到 HALT 退休、非法访存在 WB 报告，或周期预算耗尽。
+可选中断参数：
+
+| 参数 | 含义 |
+|---|---|
+| `interrupts` | `InterruptRequest(cycle, code=0)` 序列，按本地模拟周期到达 |
+| `interrupt_handler` | 可选回调，接收 `InterruptContext`，可观察/修改寄存器与内存，返回服务周期数或 `None` |
+| `interrupt_service_cycles` | 回调返回 `None` 时的默认服务周期数，至少 1，默认 1 |
+| `interrupt_on_busy` | `"reject"`（默认）拒绝额外请求；`"replace"` 保留新请求并记录被替换请求 |
 
 - `instructions`：`Instruction` 序列，1–200 条，最后一条必须是 `HALT`
 - `memory`：非空、长度为 4 的倍数的 `bytes/bytearray`
@@ -72,10 +81,28 @@ Instruction.halt()
 | `cycles` | `CycleSlots` 序列，每周期 5 个 `Slot`（IF/ID/EX/MEM/WB） |
 | `halted` | 是否由 HALT 正常结束 |
 | `fault` / `fault_pc` / `fault_cycle` | 异常类型（仅 `Fault.ADDR`）、指令下标、报告周期 |
+| `interrupts` | 已进入并完成的 `InterruptRecord` 序列 |
+| `rejected_interrupts` | 显式拒绝/替换的请求记录，不会悄悄丢失 |
+| `pending_interrupt` | 因故障/HALT 停机而尚未处理的挂起请求（如有） |
 
 `Slot(index, bubble, reason)`：`reason` 取 `None`/`"drain"`（启动排空）/
 `"stall"`（load-use 气泡，沿 EX→MEM→WB 传播）/`"hold"`（停顿冻结 IF/ID）/
 `"flush"`（分支冲刷）/`"take"`（分支命中的 EX 槽）/`"fault"`（故障丢弃/报告）。
+
+### 外部中断精确边界
+
+请求到达后只置外部挂起位，不立即打断 EX/MEM。只有某个周期 WB 中存在可提交
+指令，并且该指令不是故障/HALT 时，才在其提交后进入中断：
+
+1. 进入前的 `committed_pc` 指令已经提交，架构寄存器/内存一致；
+2. 同周期 MEM/EX/ID/IF 中更年轻的指令全部未提交，清管丢弃；
+3. BEQ 以退休时的决定为准：命中则 `resume_pc = branch_target`，否则 `pc+1`；
+4. 服务周期用 `iservice` 气泡记录；服务结束后从 `resume_pc` 重新取指；
+5. 指令仍严格退休一次，冲刷或中断丢弃的年轻指令不会重复提交。
+
+同周期优先级固定为：**WB 访存故障 > WB HALT > WB 普通指令后的中断**。
+故障/HALT 时已挂起的中断保留在 `pending_interrupt`；处理期间只保留一个新请求，
+更多请求按 `interrupt_on_busy` 拒绝或替换，并进入 `rejected_interrupts`。
 
 ### `tinycpu.run_sequential(instructions, memory, initial_regs=None) -> SeqResult`
 
@@ -103,7 +130,7 @@ Instruction.halt()
 - 数据内存：1 B–1 MiB（`MAX_MEMORY_BYTES`），长度须为 4 的倍数
 - 立即数/寄存器初值：32 位范围；寄存器号 0–31
 
-## 精确异常与时序设计取舍
+## 精确异常、中断与时序设计取舍
 
 1. **提交点唯一在 WB**。寄存器写回与 STORE 内存写都在 WB 执行。非法访存
    在 EX/MEM 已被识别（`bad_addr`），但只置标记、不访问内存，等该指令流到
@@ -121,7 +148,10 @@ Instruction.halt()
 5. **程序必须以 HALT 结尾且 BEQ 目标静态可查**。这是本子集的刻意收窄：
    顺序执行"掉出程序末尾"没有定义意义，故直接拒绝而非隐式停机。
 6. LOAD 读内存在 MEM 级发生；地址非法时不触碰内存（避免越界切片）。
-7. 顺序参考是独立实现，期望值不依赖被测核心；"两轮流水线结果相同"式的
+7. 外部中断是模拟器级同步事件，不增加新的 ISA 指令或向量表。回调可直接修改
+   传入的 `regs`/`memory` 来模拟处理程序副作用；不这样做时处理器状态只按
+   原程序继续。
+8. 顺序参考是独立实现，期望值不依赖被测核心；“两轮流水线结果相同”式的
    往返一致只在测试中作为补充性结构断言。
 
 ## 浮点 / 数值误差口径
@@ -140,6 +170,7 @@ tinycpu/pipeline.py     五级流水线周期内核（被测核心）
 tinycpu/sequential.py   独立顺序参考解释器（不依赖 pipeline）
 tests/test_inputs.py    输入校验与错误语义
 tests/test_pipeline.py  流水线时序：停顿/前递/冲刷/精确异常/上限
+tests/test_interrupts.py 外部中断：精确边界、分支返回、优先级、请求保留/拒绝
 tests/test_equivalence.py  与顺序参考的差分测试（700 个确定性随机程序）
 demo.py                 固定输入演示
 ```
@@ -148,8 +179,8 @@ demo.py                 固定输入演示
 
 - 只实现题目规定的 7 条指令，不是完整 RISC-V/MIPS 行业标准实现，不做此类宣称。
 - 无指令内存/取指异常概念；指令以下标数组给出，不做取指地址翻译。
-- 只有一种异常：数据访存地址错（非对齐或越界）；没有中断、系统调用、
-  除零、溢出异常（加减法按模回绕，不视为异常）。
+- 只有一种处理器异常：数据访存地址错（非对齐或越界）；另有模拟器同步的外部
+  中断；没有系统调用、除零、溢出异常（加减法按模回绕，不视为异常）。
 - BEQ 目标静态校验落在程序内；后向分支死循环由 2000 周期预算截断为
   `CycleLimitError`，这是预算限制而非程序故障。
 - 内存上限 1 MiB 为本实现的固定边界（题目未规定数据内存大小）。
